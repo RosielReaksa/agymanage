@@ -39,12 +39,32 @@ export const saasUsers = sqliteTable('saas_users', {
 export const saasApiKeys = sqliteTable('saas_api_keys', {
   id: text('id').primaryKey(),
   userId: text('user_id').notNull(),
+  partnerId: text('partner_id'),
   keyHash: text('key_hash').notNull().unique(),
   keyPrefix: text('key_prefix').notNull(),
   label: text('label').notNull(),
   isActive: integer('is_active').notNull().default(1),
   createdAt: integer('created_at').notNull(),
   lastUsedAt: integer('last_used_at'),
+});
+
+export const saasPartners = sqliteTable('saas_partners', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  monthlySpendCap: real('monthly_spend_cap').notNull().default(100.0),
+  currentMonthSpend: real('current_month_spend').notNull().default(0.0),
+  createdAt: integer('created_at').notNull(),
+});
+
+export const saasAccessRequests = sqliteTable('saas_access_requests', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull(),
+  organization: text('organization'),
+  useCase: text('use_case'),
+  estimatedVolume: text('estimated_volume'),
+  status: text('status').notNull().default('pending'),
+  createdAt: integer('created_at').notNull(),
 });
 
 export const saasUsageLogs = sqliteTable('saas_usage_logs', {

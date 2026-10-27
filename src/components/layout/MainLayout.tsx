@@ -15,6 +15,12 @@ import {
   Sparkles,
   Plus,
   Coins,
+  Bot,
+  Building2,
+  Inbox,
+  Terminal,
+  Globe,
+  ArrowUpRight,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -22,7 +28,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { ErrorBoundary } from 'react-error-boundary';
 import { useToast } from '@/components/ui/use-toast';
 import { getLocalizedErrorMessage } from '@/shared/utils/errorMessages';
-import { useSaasUser } from '@/modules/saas/hooks/useSaas';
+import { useSaasUser, useSaasAccessRequests } from '@/modules/saas/hooks/useSaas';
 import { AddCreditsModal } from '@/modules/saas/components/AddCreditsModal';
 
 export const MainLayout: React.FC = () => {
@@ -32,6 +38,9 @@ export const MainLayout: React.FC = () => {
   const hasShownRouteErrorToastRef = useRef(false);
 
   const { data: user } = useSaasUser();
+  const { data: accessRequests = [] } = useSaasAccessRequests();
+  const pendingRequestsCount = accessRequests.filter((r) => r.status === 'pending').length;
+
   const [addCreditsOpen, setAddCreditsOpen] = useState(false);
 
   // Initialize state from localStorage if available, default to false (expanded)
@@ -50,6 +59,22 @@ export const MainLayout: React.FC = () => {
       to: '/',
       icon: Sparkles,
       label: t('nav.overview', 'Gateway Overview'),
+    },
+    {
+      to: '/playground',
+      icon: Terminal,
+      label: t('nav.playground', 'Playground'),
+    },
+    {
+      to: '/partners',
+      icon: Building2,
+      label: t('nav.partners', 'Partners'),
+    },
+    {
+      to: '/access-requests',
+      icon: Inbox,
+      label: t('nav.accessRequests', 'Access Requests'),
+      badge: pendingRequestsCount > 0 ? pendingRequestsCount : undefined,
     },
     {
       to: '/pool',
@@ -95,6 +120,15 @@ export const MainLayout: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-3">
+            <Link
+              to={'/landing' as any}
+              className="h-8 text-xs font-medium px-3 rounded-xl border border-border bg-card hover:bg-accent text-muted-foreground hover:text-foreground flex items-center gap-1.5 transition-all shadow-soft-sm"
+            >
+              <Globe className="h-3.5 w-3.5 text-stone-400" />
+              <span>Public Site</span>
+              <ArrowUpRight className="h-3 w-3 text-stone-400" />
+            </Link>
+
             <div className="font-mono text-xs px-3 py-1.5 rounded-full bg-card border border-border text-muted-foreground flex items-center gap-2 shadow-soft-sm">
               <span className="h-2 w-2 rounded-full bg-[#4D7C5F] animate-pulse"></span>
               <span>
@@ -144,11 +178,27 @@ export const MainLayout: React.FC = () => {
                               : 'hover:bg-sidebar-accent/70 text-muted-foreground hover:text-foreground',
                           )}
                         >
-                          <item.icon className="h-4 w-4" aria-hidden="true" />
+                          <div className="relative">
+                            <item.icon className="h-4 w-4" aria-hidden="true" />
+                            {typeof item.badge === 'number' && item.badge > 0 && (
+                              <span className="absolute -top-1.5 -right-1.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#C85A32] text-[9px] font-mono text-white">
+                                {item.badge}
+                              </span>
+                            )}
+                          </div>
                           <span className="sr-only">{item.label}</span>
                         </Link>
                       </TooltipTrigger>
-                      <TooltipContent side="right">{item.label}</TooltipContent>
+                      <TooltipContent side="right">
+                        <div className="flex items-center gap-1.5">
+                          <span>{item.label}</span>
+                          {typeof item.badge === 'number' && item.badge > 0 && (
+                            <span className="font-mono text-[10px] text-[#C85A32]">
+                              ({item.badge})
+                            </span>
+                          )}
+                        </div>
+                      </TooltipContent>
                     </Tooltip>
                   );
                 }
@@ -159,14 +209,21 @@ export const MainLayout: React.FC = () => {
                     to={item.to}
                     aria-current={isActive ? 'page' : undefined}
                     className={cn(
-                      'focus-visible:ring-ring flex h-10 cursor-default items-center gap-3 rounded-xl px-3.5 text-sm outline-none focus-visible:ring-2 transition-all',
+                      'focus-visible:ring-ring flex h-10 cursor-default items-center justify-between rounded-xl px-3.5 text-sm outline-none focus-visible:ring-2 transition-all',
                       isActive
                         ? 'bg-sidebar-accent text-[#C85A32] dark:text-[#E28567] ring-sidebar-border font-semibold ring-1 ring-inset shadow-soft-sm'
                         : 'hover:bg-sidebar-accent/70 text-muted-foreground hover:text-foreground',
                     )}
                   >
-                    <item.icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                    <span className="truncate">{item.label}</span>
+                    <div className="flex items-center gap-3 min-w-0">
+                      <item.icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                      <span className="truncate">{item.label}</span>
+                    </div>
+                    {typeof item.badge === 'number' && item.badge > 0 && (
+                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded-full bg-[#F4ECE7] text-[#C85A32] border border-[#E8D6CC] dark:bg-[#2A201C] dark:text-[#E28567] dark:border-[#3D2C24]">
+                        {item.badge}
+                      </span>
+                    )}
                   </Link>
                 );
               })}

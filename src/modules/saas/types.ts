@@ -107,3 +107,64 @@ export interface RecordUsageInput {
   status?: 'success' | 'error';
   latencyMs?: number;
 }
+
+export const SaasPartnerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  monthlySpendCap: z.number(),
+  currentMonthSpend: z.number(),
+  createdAt: z.number(),
+  apiKeyCount: z.number().optional(),
+});
+export type SaasPartner = z.infer<typeof SaasPartnerSchema>;
+
+export const CreatePartnerInputSchema = z.object({
+  name: z.string().min(1),
+  monthlySpendCap: z.number().default(100.0),
+});
+export type CreatePartnerInput = z.infer<typeof CreatePartnerInputSchema>;
+
+export const SaasAccessRequestSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  email: z.string().email(),
+  organization: z.string().nullable().optional(),
+  useCase: z.string().nullable().optional(),
+  estimatedVolume: z.string().nullable().optional(),
+  status: z.enum(['pending', 'approved', 'rejected']),
+  createdAt: z.number(),
+});
+export type SaasAccessRequest = z.infer<typeof SaasAccessRequestSchema>;
+
+export const SubmitAccessRequestInputSchema = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+  organization: z.string().optional(),
+  useCase: z.string().optional(),
+  estimatedVolume: z.string().optional(),
+});
+export type SubmitAccessRequestInput = z.infer<typeof SubmitAccessRequestInputSchema>;
+
+export const PlaygroundRunInputSchema = z.object({
+  model: z.string(),
+  messages: z.array(z.object({
+    role: z.enum(['system', 'user', 'assistant']),
+    content: z.string(),
+  })),
+  system: z.string().optional(),
+  temperature: z.number().min(0).max(2).default(0.7),
+  max_tokens: z.number().min(1).max(8192).default(1024),
+  top_p: z.number().min(0).max(1).default(1),
+});
+export type PlaygroundRunInput = z.infer<typeof PlaygroundRunInputSchema>;
+
+export const PlaygroundRunOutputSchema = z.object({
+  content: z.string(),
+  model: z.string(),
+  promptTokens: z.number(),
+  completionTokens: z.number(),
+  totalTokens: z.number(),
+  costUsd: z.number(),
+  latencyMs: z.number(),
+});
+export type PlaygroundRunOutput = z.infer<typeof PlaygroundRunOutputSchema>;

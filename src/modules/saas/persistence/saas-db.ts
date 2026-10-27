@@ -26,6 +26,7 @@ export function ensureSaasTables(db: Database.Database): void {
       CREATE TABLE IF NOT EXISTS saas_api_keys (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
+        partner_id TEXT,
         key_hash TEXT UNIQUE NOT NULL,
         key_prefix TEXT NOT NULL,
         label TEXT NOT NULL,
@@ -33,6 +34,25 @@ export function ensureSaasTables(db: Database.Database): void {
         created_at INTEGER NOT NULL,
         last_used_at INTEGER,
         FOREIGN KEY (user_id) REFERENCES saas_users(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_partners (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        monthly_spend_cap REAL NOT NULL DEFAULT 100.0,
+        current_month_spend REAL NOT NULL DEFAULT 0.0,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_access_requests (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        organization TEXT,
+        use_case TEXT,
+        estimated_volume TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS saas_usage_logs (
@@ -54,6 +74,12 @@ export function ensureSaasTables(db: Database.Database): void {
       CREATE INDEX IF NOT EXISTS idx_saas_usage_logs_user ON saas_usage_logs(user_id);
       CREATE INDEX IF NOT EXISTS idx_saas_usage_logs_created ON saas_usage_logs(created_at);
     `);
+
+    try {
+      db.exec('ALTER TABLE saas_api_keys ADD COLUMN partner_id TEXT;');
+    } catch {
+      // Column already exists
+    }
 
     const existingUser = db
       .prepare('SELECT id FROM saas_users WHERE email = ?')

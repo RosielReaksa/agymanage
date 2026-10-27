@@ -10,9 +10,18 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AccessRequestsRouteImport } from './routes/access-requests'
+import { Route as DocsRouteImport } from './routes/docs'
+import { Route as LandingRouteImport } from './routes/landing'
+import { Route as ModelsRouteImport } from './routes/models'
+import { Route as PartnersRouteImport } from './routes/partners'
+import { Route as PlaygroundRouteImport } from './routes/playground'
 import { Route as PoolRouteImport } from './routes/pool'
+import { Route as PrivacyRouteImport } from './routes/privacy'
 import { Route as ProxyRouteImport } from './routes/proxy'
+import { Route as RequestAccessRouteImport } from './routes/request-access'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as TermsRouteImport } from './routes/terms'
 import { Route as TrafficRouteImport } from './routes/traffic'
 
 const IndexRoute = IndexRouteImport.update({
@@ -20,9 +29,44 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AccessRequestsRoute = AccessRequestsRouteImport.update({
+  id: '/access-requests',
+  path: '/access-requests',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DocsRoute = DocsRouteImport.update({
+  id: '/docs',
+  path: '/docs',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LandingRoute = LandingRouteImport.update({
+  id: '/landing',
+  path: '/landing',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ModelsRoute = ModelsRouteImport.update({
+  id: '/models',
+  path: '/models',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PartnersRoute = PartnersRouteImport.update({
+  id: '/partners',
+  path: '/partners',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PlaygroundRoute = PlaygroundRouteImport.update({
+  id: '/playground',
+  path: '/playground',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PoolRoute = PoolRouteImport.update({
   id: '/pool',
   path: '/pool',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PrivacyRoute = PrivacyRouteImport.update({
+  id: '/privacy',
+  path: '/privacy',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProxyRoute = ProxyRouteImport.update({
@@ -30,9 +74,19 @@ const ProxyRoute = ProxyRouteImport.update({
   path: '/proxy',
   getParentRoute: () => rootRouteImport,
 } as any)
+const RequestAccessRoute = RequestAccessRouteImport.update({
+  id: '/request-access',
+  path: '/request-access',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TermsRoute = TermsRouteImport.update({
+  id: '/terms',
+  path: '/terms',
   getParentRoute: () => rootRouteImport,
 } as any)
 const TrafficRoute = TrafficRouteImport.update({
@@ -43,39 +97,118 @@ const TrafficRoute = TrafficRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/access-requests': typeof AccessRequestsRoute
+  '/docs': typeof DocsRoute
+  '/landing': typeof LandingRoute
+  '/models': typeof ModelsRoute
+  '/partners': typeof PartnersRoute
+  '/playground': typeof PlaygroundRoute
   '/pool': typeof PoolRoute
+  '/privacy': typeof PrivacyRoute
   '/proxy': typeof ProxyRoute
+  '/request-access': typeof RequestAccessRoute
   '/settings': typeof SettingsRoute
+  '/terms': typeof TermsRoute
   '/traffic': typeof TrafficRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/access-requests': typeof AccessRequestsRoute
+  '/docs': typeof DocsRoute
+  '/landing': typeof LandingRoute
+  '/models': typeof ModelsRoute
+  '/partners': typeof PartnersRoute
+  '/playground': typeof PlaygroundRoute
   '/pool': typeof PoolRoute
+  '/privacy': typeof PrivacyRoute
   '/proxy': typeof ProxyRoute
+  '/request-access': typeof RequestAccessRoute
   '/settings': typeof SettingsRoute
+  '/terms': typeof TermsRoute
   '/traffic': typeof TrafficRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/access-requests': typeof AccessRequestsRoute
+  '/docs': typeof DocsRoute
+  '/landing': typeof LandingRoute
+  '/models': typeof ModelsRoute
+  '/partners': typeof PartnersRoute
+  '/playground': typeof PlaygroundRoute
   '/pool': typeof PoolRoute
+  '/privacy': typeof PrivacyRoute
   '/proxy': typeof ProxyRoute
+  '/request-access': typeof RequestAccessRoute
   '/settings': typeof SettingsRoute
+  '/terms': typeof TermsRoute
   '/traffic': typeof TrafficRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/pool' | '/proxy' | '/settings' | '/traffic'
+  fullPaths:
+    | '/'
+    | '/access-requests'
+    | '/docs'
+    | '/landing'
+    | '/models'
+    | '/partners'
+    | '/playground'
+    | '/pool'
+    | '/privacy'
+    | '/proxy'
+    | '/request-access'
+    | '/settings'
+    | '/terms'
+    | '/traffic'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/pool' | '/proxy' | '/settings' | '/traffic'
-  id: '__root__' | '/' | '/pool' | '/proxy' | '/settings' | '/traffic'
+  to:
+    | '/'
+    | '/access-requests'
+    | '/docs'
+    | '/landing'
+    | '/models'
+    | '/partners'
+    | '/playground'
+    | '/pool'
+    | '/privacy'
+    | '/proxy'
+    | '/request-access'
+    | '/settings'
+    | '/terms'
+    | '/traffic'
+  id:
+    | '__root__'
+    | '/'
+    | '/access-requests'
+    | '/docs'
+    | '/landing'
+    | '/models'
+    | '/partners'
+    | '/playground'
+    | '/pool'
+    | '/privacy'
+    | '/proxy'
+    | '/request-access'
+    | '/settings'
+    | '/terms'
+    | '/traffic'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AccessRequestsRoute: typeof AccessRequestsRoute
+  DocsRoute: typeof DocsRoute
+  LandingRoute: typeof LandingRoute
+  ModelsRoute: typeof ModelsRoute
+  PartnersRoute: typeof PartnersRoute
+  PlaygroundRoute: typeof PlaygroundRoute
   PoolRoute: typeof PoolRoute
+  PrivacyRoute: typeof PrivacyRoute
   ProxyRoute: typeof ProxyRoute
+  RequestAccessRoute: typeof RequestAccessRoute
   SettingsRoute: typeof SettingsRoute
+  TermsRoute: typeof TermsRoute
   TrafficRoute: typeof TrafficRoute
 }
 
@@ -88,11 +221,60 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/access-requests': {
+      id: '/access-requests'
+      path: '/access-requests'
+      fullPath: '/access-requests'
+      preLoaderRoute: typeof AccessRequestsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/docs': {
+      id: '/docs'
+      path: '/docs'
+      fullPath: '/docs'
+      preLoaderRoute: typeof DocsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/landing': {
+      id: '/landing'
+      path: '/landing'
+      fullPath: '/landing'
+      preLoaderRoute: typeof LandingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/models': {
+      id: '/models'
+      path: '/models'
+      fullPath: '/models'
+      preLoaderRoute: typeof ModelsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/partners': {
+      id: '/partners'
+      path: '/partners'
+      fullPath: '/partners'
+      preLoaderRoute: typeof PartnersRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/playground': {
+      id: '/playground'
+      path: '/playground'
+      fullPath: '/playground'
+      preLoaderRoute: typeof PlaygroundRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/pool': {
       id: '/pool'
       path: '/pool'
       fullPath: '/pool'
       preLoaderRoute: typeof PoolRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/privacy': {
+      id: '/privacy'
+      path: '/privacy'
+      fullPath: '/privacy'
+      preLoaderRoute: typeof PrivacyRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/proxy': {
@@ -102,11 +284,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProxyRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/request-access': {
+      id: '/request-access'
+      path: '/request-access'
+      fullPath: '/request-access'
+      preLoaderRoute: typeof RequestAccessRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/settings': {
       id: '/settings'
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/terms': {
+      id: '/terms'
+      path: '/terms'
+      fullPath: '/terms'
+      preLoaderRoute: typeof TermsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/traffic': {
@@ -121,9 +317,18 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AccessRequestsRoute: AccessRequestsRoute,
+  DocsRoute: DocsRoute,
+  LandingRoute: LandingRoute,
+  ModelsRoute: ModelsRoute,
+  PartnersRoute: PartnersRoute,
+  PlaygroundRoute: PlaygroundRoute,
   PoolRoute: PoolRoute,
+  PrivacyRoute: PrivacyRoute,
   ProxyRoute: ProxyRoute,
+  RequestAccessRoute: RequestAccessRoute,
   SettingsRoute: SettingsRoute,
+  TermsRoute: TermsRoute,
   TrafficRoute: TrafficRoute,
 }
 export const routeTree = rootRouteImport

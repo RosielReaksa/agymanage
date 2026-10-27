@@ -1,12 +1,26 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ipc } from '@/ipc/manager';
-import type { SaaSUser, ApiKey, CreatedSaasApiKey, ModelInfo, UsageLog } from '../types';
+import type {
+  SaaSUser,
+  ApiKey,
+  CreatedSaasApiKey,
+  ModelInfo,
+  UsageLog,
+  SaasPartner,
+  SaasAccessRequest,
+  CreatePartnerInput,
+  SubmitAccessRequestInput,
+  PlaygroundRunInput,
+  PlaygroundRunOutput,
+} from '../types';
 
 export const SAAS_QUERY_KEYS = {
   user: ['saas', 'user'],
   keys: ['saas', 'keys'],
   models: ['saas', 'models'],
   usageLogs: ['saas', 'usageLogs'],
+  partners: ['saas', 'partners'],
+  accessRequests: ['saas', 'accessRequests'],
 };
 
 export function useSaasUser() {
@@ -86,6 +100,92 @@ export function useAddCredits() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.user });
+    },
+  });
+}
+
+export function useSaasPartners() {
+  return useQuery<SaasPartner[]>({
+    queryKey: SAAS_QUERY_KEYS.partners,
+    queryFn: async () => {
+      return await ipc.client.saas.listPartners();
+    },
+    staleTime: 30000,
+  });
+}
+
+export function useCreatePartner() {
+  const queryClient = useQueryClient();
+
+  return useMutation<SaasPartner, Error, CreatePartnerInput>({
+    mutationFn: async (input: CreatePartnerInput) => {
+      return await ipc.client.saas.createPartner(input);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.partners });
+    },
+  });
+}
+
+export function useSaasAccessRequests() {
+  return useQuery<SaasAccessRequest[]>({
+    queryKey: SAAS_QUERY_KEYS.accessRequests,
+    queryFn: async () => {
+      return await ipc.client.saas.listAccessRequests();
+    },
+    staleTime: 15000,
+  });
+}
+
+export function useSubmitAccessRequest() {
+  return useMutation<SaasAccessRequest, Error, SubmitAccessRequestInput>({
+    mutationFn: async (input: SubmitAccessRequestInput) => {
+      return await ipc.client.saas.submitAccessRequest(input);
+    },
+  });
+}
+
+export function useApproveAccessRequest() {
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    { request: SaasAccessRequest; user: SaaSUser; key: CreatedSaasApiKey },
+    Error,
+    { id: string }
+  >({
+    mutationFn: async ({ id }: { id: string }) => {
+      return (await ipc.client.saas.approveAccessRequest({ id })) as {
+        request: SaasAccessRequest;
+        user: SaaSUser;
+        key: CreatedSaasApiKey;
+      };
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.accessRequests });
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.keys });
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.partners });
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.user });
+    },
+  });
+}
+
+export function useRejectAccessRequest() {
+  const queryClient = useQueryClient();
+
+  return useMutation<SaasAccessRequest, Error, { id: string }>({
+    mutationFn: async ({ id }: { id: string }) => {
+      return (await ipc.client.saas.rejectAccessRequest({ id })) as SaasAccessRequest;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.accessRequests });
+    },
+  });
+}
+
+export function useRunPlayground() {
+  return useMutation<PlaygroundRunOutput, Error, PlaygroundRunInput>({
+    mutationFn: async (input: PlaygroundRunInput) => {
+      return await ipc.client.saas.runPlayground(input);
     },
   });
 }

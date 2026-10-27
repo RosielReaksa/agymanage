@@ -3,10 +3,16 @@ import { z } from 'zod';
 import { saasService } from '../services/saas.service';
 import {
   CreatedSaasApiKeySchema,
+  CreatePartnerInputSchema,
+  PlaygroundRunInputSchema,
+  PlaygroundRunOutputSchema,
+  SaasAccessRequestSchema,
   SaasApiKeySchema,
   SaasModelCatalogItemSchema,
+  SaasPartnerSchema,
   SaasUsageLogSchema,
   SaasUserSchema,
+  SubmitAccessRequestInputSchema,
 } from '../types';
 
 export const saasRouter = os.router({
@@ -80,5 +86,58 @@ export const saasRouter = os.router({
     .output(z.array(SaasModelCatalogItemSchema))
     .handler(async () => {
       return saasService.getModelCatalog();
+    }),
+
+  listPartners: os
+    .output(z.array(SaasPartnerSchema))
+    .handler(async () => {
+      return saasService.listPartners();
+    }),
+
+  createPartner: os
+    .input(CreatePartnerInputSchema)
+    .output(SaasPartnerSchema)
+    .handler(async ({ input }) => {
+      return saasService.createPartner(input);
+    }),
+
+  submitAccessRequest: os
+    .input(SubmitAccessRequestInputSchema)
+    .output(SaasAccessRequestSchema)
+    .handler(async ({ input }) => {
+      return saasService.submitAccessRequest(input);
+    }),
+
+  listAccessRequests: os
+    .output(z.array(SaasAccessRequestSchema))
+    .handler(async () => {
+      return saasService.listAccessRequests();
+    }),
+
+  approveAccessRequest: os
+    .input(z.object({ id: z.string().min(1) }))
+    .output(
+      z.object({
+        request: SaasAccessRequestSchema,
+        user: SaasUserSchema,
+        key: CreatedSaasApiKeySchema,
+      }),
+    )
+    .handler(async ({ input }) => {
+      return saasService.approveAccessRequest(input.id);
+    }),
+
+  rejectAccessRequest: os
+    .input(z.object({ id: z.string().min(1) }))
+    .output(SaasAccessRequestSchema)
+    .handler(async ({ input }) => {
+      return saasService.rejectAccessRequest(input.id);
+    }),
+
+  runPlayground: os
+    .input(PlaygroundRunInputSchema)
+    .output(PlaygroundRunOutputSchema)
+    .handler(async ({ input }) => {
+      return saasService.runPlayground(input);
     }),
 });

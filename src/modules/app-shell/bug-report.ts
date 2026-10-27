@@ -1,9 +1,19 @@
 import type { BugReportEnvironment } from './bug-report-environment';
 import { redactDiagnosticText } from '@/shared/observability/sentryPrivacy';
-import bugReportTemplate from '../../../.github/ISSUE_TEMPLATE/bug_report.md?raw';
 
 export const BUG_REPORT_URL =
-  'https://github.com/Draculabo/AntigravityManager/issues/new?template=bug_report.md';
+  'https://github.com/RosielReaksa/agymanage/issues/new';
+
+const bugReportTemplate = `
+## Screenshots or Diagnostic Details
+
+## Environment
+- **App version**:
+- **Operating system and version**:
+- **CPU architecture**:
+
+## Additional Context
+`;
 
 /** Keep report text out of the URL; users review, paste and submit it themselves. */
 export function buildErrorBugReport(
@@ -19,10 +29,10 @@ export function buildErrorBugReport(
   const sections = template.replaceAll('\r\n', '\n').split(/\n(?=## )/);
   return sections
     .map((section) => {
-      if (section.startsWith('## Screenshots or Diagnostic Details\n')) {
+      if (section.startsWith('## Screenshots or Diagnostic Details')) {
         return `${section.trim()}\n\n${errorBlock}\n`;
       }
-      if (section.startsWith('## Environment\n')) {
+      if (section.startsWith('## Environment')) {
         return section
           .replace('- **App version**:', `- **App version**: ${environment.appVersion}`)
           .replace(
@@ -32,13 +42,9 @@ export function buildErrorBugReport(
           .replace(
             /- \*\*CPU architecture\*\*:.*/,
             `- **CPU architecture**: ${environment.architecture}`,
-          )
-          .replace(
-            '### Source Development Only',
-            `- **Electron version**: ${environment.electronVersion}\n- **Bundled Node.js version**: ${environment.nodeVersion}\n\n### Source Development Only`,
           );
       }
-      if (section.startsWith('## Additional Context\n')) {
+      if (section.startsWith('## Additional Context')) {
         return `${section.trim()}\n\n${redactDiagnosticText(summary)}\n`;
       }
       return section;
