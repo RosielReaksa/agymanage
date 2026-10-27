@@ -59,14 +59,87 @@ export function ensureSaasTables(db: Database.Database): void {
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         api_key_id TEXT,
+        request_id TEXT,
+        provider TEXT DEFAULT 'antigravity',
         model TEXT NOT NULL,
         prompt_tokens INTEGER NOT NULL DEFAULT 0,
         completion_tokens INTEGER NOT NULL DEFAULT 0,
         total_tokens INTEGER NOT NULL DEFAULT 0,
         cost_usd REAL NOT NULL DEFAULT 0.0,
+        price_usd REAL NOT NULL DEFAULT 0.0,
+        latency_ms INTEGER NOT NULL DEFAULT 0,
+        status_code INTEGER NOT NULL DEFAULT 200,
+        cached INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         FOREIGN KEY (user_id) REFERENCES saas_users(id) ON DELETE CASCADE,
         FOREIGN KEY (api_key_id) REFERENCES saas_api_keys(id) ON DELETE SET NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_providers (
+        id TEXT PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        label TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        api_key TEXT,
+        priority INTEGER NOT NULL DEFAULT 100,
+        is_free_tier INTEGER NOT NULL DEFAULT 0,
+        monthly_cap_usd REAL,
+        rpm_limit INTEGER,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        paused INTEGER NOT NULL DEFAULT 0,
+        paused_reason TEXT,
+        health_status TEXT NOT NULL DEFAULT 'healthy',
+        last_latency_ms INTEGER,
+        last_checked_at INTEGER,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_routing_rules (
+        id TEXT PRIMARY KEY,
+        position INTEGER NOT NULL DEFAULT 0,
+        condition_json TEXT NOT NULL DEFAULT '{}',
+        action_json TEXT NOT NULL DEFAULT '{}',
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_routing_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_maintenance_state (
+        id TEXT PRIMARY KEY,
+        global_active INTEGER NOT NULL DEFAULT 0,
+        global_message TEXT,
+        global_started_at INTEGER,
+        global_expected_end INTEGER,
+        global_allow_ips TEXT,
+        degraded_active INTEGER NOT NULL DEFAULT 0,
+        degraded_paid_only INTEGER NOT NULL DEFAULT 0,
+        degraded_free_only INTEGER NOT NULL DEFAULT 0,
+        degraded_reduce_pct INTEGER NOT NULL DEFAULT 0,
+        degraded_max_tokens INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_maintenance_windows (
+        id TEXT PRIMARY KEY,
+        starts_at INTEGER NOT NULL,
+        ends_at INTEGER NOT NULL,
+        banner_text TEXT NOT NULL,
+        auto_enable INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'scheduled',
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS saas_maintenance_history (
+        id TEXT PRIMARY KEY,
+        level TEXT NOT NULL,
+        target TEXT,
+        action TEXT NOT NULL,
+        reason TEXT,
+        created_at INTEGER NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_saas_api_keys_hash ON saas_api_keys(key_hash);
@@ -79,6 +152,73 @@ export function ensureSaasTables(db: Database.Database): void {
       db.exec('ALTER TABLE saas_api_keys ADD COLUMN partner_id TEXT;');
     } catch {
       // Column already exists
+    }
+
+    try {
+      db.exec('ALTER TABLE saas_usage_logs ADD COLUMN request_id TEXT;');
+    } catch {
+      // Column exists
+    }
+    try {
+      db.exec('ALTER TABLE saas_usage_logs ADD COLUMN provider TEXT DEFAULT "antigravity";');
+    } catch {
+      // Column exists
+    }
+    try {
+      db.exec('ALTER TABLE saas_usage_logs ADD COLUMN price_usd REAL DEFAULT 0.0;');
+    } catch {
+      // Column exists
+    }
+    try {
+      db.exec('ALTER TABLE saas_usage_logs ADD COLUMN latency_ms INTEGER DEFAULT 0;');
+    } catch {
+      // Column exists
+    }
+    try {
+      db.exec('ALTER TABLE saas_usage_logs ADD COLUMN status_code INTEGER DEFAULT 200;');
+    } catch {
+      // Column exists
+    }
+    try {
+      db.exec('ALTER TABLE saas_usage_logs ADD COLUMN cached INTEGER DEFAULT 0;');
+    } catch {
+      // Column exists
+    }
+
+    try {
+      db.exec('CREATE INDEX IF NOT EXISTS idx_saas_usage_logs_req ON saas_usage_logs(request_id);');
+    } catch {
+      // Ignore
+    }
+
+    // Initialize maintenance state row 1 if missing
+    const maint = db.prepare('SELECT id FROM saas_maintenance_state WHERE id = ?').get('1');
+    if (!maint) {
+      db.prepare(`
+        INSERT INTO saas_maintenance_state (
+          id, global_active, global_message, degraded_active, degraded_paid_only,
+          degraded_free_only, degraded_reduce_pct, degraded_max_tokens, updated_at
+        ) VALUES ('1', 0, 'We are upgrading our gateway cluster. Back online shortly.', 0, 0, 0, 0, 2000, ?)
+      `).run(Date.now());
+    }
+
+    // Seed default providers if none exist
+    const providerCount = (db.prepare('SELECT COUNT(*) as count FROM saas_providers').get() as { count: number }).count;
+    if (providerCount === 0) {
+      const now = Date.now();
+      const insert = db.prepare(`
+        INSERT INTO saas_providers (
+          id, name, label, base_url, api_key, priority, is_free_tier,
+          monthly_cap_usd, rpm_limit, is_active, paused, health_status, last_latency_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'healthy', ?, ?)
+      `);
+
+      insert.run('1', 'gemini', 'Google Gemini', 'https://generativelanguage.googleapis.com/v1beta', '', 10, 0, 500, 300, 185, now);
+      insert.run('2', 'groq', 'Groq LPU', 'https://api.groq.com/openai/v1', '', 20, 0, 250, 1000, 95, now);
+      insert.run('3', 'openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1', '', 30, 0, 500, 200, 320, now);
+      insert.run('4', 'deepseek', 'DeepSeek', 'https://api.deepseek.com/v1', '', 40, 0, 300, 150, 410, now);
+      insert.run('5', 'together', 'Together AI', 'https://api.together.xyz/v1', '', 50, 0, 300, 120, 290, now);
+      insert.run('6', 'openai', 'OpenAI', 'https://api.openai.com/v1', '', 60, 0, 1000, 500, 240, now);
     }
 
     const existingUser = db

@@ -12,7 +12,7 @@ describe('bug-report environment IPC', () => {
       platform: process.platform,
       osVersion: `${version()} (${release()})`,
       architecture: process.arch,
-      electronVersion: process.versions.electron ?? 'Unavailable',
+      electronVersion: process.versions.electron ?? 'Web',
       nodeVersion: process.versions.node,
     });
   });

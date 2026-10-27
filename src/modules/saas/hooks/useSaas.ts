@@ -1,17 +1,30 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ipc } from '@/ipc/manager';
 import type {
-  SaaSUser,
+  ActivityFilterInput,
+  ActivityResponse,
   ApiKey,
   CreatedSaasApiKey,
-  ModelInfo,
-  UsageLog,
-  SaasPartner,
-  SaasAccessRequest,
   CreatePartnerInput,
-  SubmitAccessRequestInput,
+  ModelInfo,
   PlaygroundRunInput,
   PlaygroundRunOutput,
+  SaasAccessRequest,
+  SaasMaintenanceHistoryItem,
+  SaasMaintenanceState,
+  SaasMaintenanceWindow,
+  SaasPartner,
+  SaasProvider,
+  SaasRoutingConfig,
+  SaasRoutingRule,
+  SaaSUser,
+  SaveProviderInput,
+  SaveRoutingRuleInput,
+  SetDegradedMaintenanceInput,
+  SetGlobalMaintenanceInput,
+  SubmitAccessRequestInput,
+  UsageLog,
+  UsageMetrics,
 } from '../types';
 
 export const SAAS_QUERY_KEYS = {
@@ -21,6 +34,13 @@ export const SAAS_QUERY_KEYS = {
   usageLogs: ['saas', 'usageLogs'],
   partners: ['saas', 'partners'],
   accessRequests: ['saas', 'accessRequests'],
+  providers: ['saas', 'providers'],
+  routingConfig: ['saas', 'routingConfig'],
+  routingRules: ['saas', 'routingRules'],
+  maintenanceState: ['saas', 'maintenanceState'],
+  maintenanceHistory: ['saas', 'maintenanceHistory'],
+  activity: ['saas', 'activity'],
+  usageMetrics: ['saas', 'usageMetrics'],
 };
 
 export function useSaasUser() {
@@ -187,5 +207,228 @@ export function useRunPlayground() {
     mutationFn: async (input: PlaygroundRunInput) => {
       return await ipc.client.saas.runPlayground(input);
     },
+  });
+}
+
+// --- Providers Hooks ---
+export function useSaasProviders() {
+  return useQuery<SaasProvider[]>({
+    queryKey: SAAS_QUERY_KEYS.providers,
+    queryFn: async () => {
+      return await ipc.client.saas.listProviders();
+    },
+    staleTime: 30000,
+  });
+}
+
+export function useSaveProvider() {
+  const queryClient = useQueryClient();
+  return useMutation<SaasProvider, Error, SaveProviderInput>({
+    mutationFn: async (input: SaveProviderInput) => {
+      return await ipc.client.saas.saveProvider(input);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.providers });
+    },
+  });
+}
+
+export function useDeleteProvider() {
+  const queryClient = useQueryClient();
+  return useMutation<{ success: boolean; id: string }, Error, { id: string }>({
+    mutationFn: async ({ id }: { id: string }) => {
+      return await ipc.client.saas.deleteProvider({ id });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.providers });
+    },
+  });
+}
+
+export function useTestProvider() {
+  const queryClient = useQueryClient();
+  return useMutation<{ ok: boolean; latencyMs: number; error?: string }, Error, { id: string }>({
+    mutationFn: async ({ id }: { id: string }) => {
+      return await ipc.client.saas.testProvider({ id });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.providers });
+    },
+  });
+}
+
+// --- Routing Hooks ---
+export function useSaasRoutingConfig() {
+  return useQuery<SaasRoutingConfig>({
+    queryKey: SAAS_QUERY_KEYS.routingConfig,
+    queryFn: async () => {
+      return await ipc.client.saas.getRoutingConfig();
+    },
+    staleTime: 30000,
+  });
+}
+
+export function useSaveRoutingConfig() {
+  const queryClient = useQueryClient();
+  return useMutation<SaasRoutingConfig, Error, Partial<SaasRoutingConfig>>({
+    mutationFn: async (input: Partial<SaasRoutingConfig>) => {
+      return await ipc.client.saas.saveRoutingConfig(input);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.routingConfig });
+    },
+  });
+}
+
+export function useSaasRoutingRules() {
+  return useQuery<SaasRoutingRule[]>({
+    queryKey: SAAS_QUERY_KEYS.routingRules,
+    queryFn: async () => {
+      return await ipc.client.saas.listRoutingRules();
+    },
+    staleTime: 30000,
+  });
+}
+
+export function useSaveRoutingRule() {
+  const queryClient = useQueryClient();
+  return useMutation<SaasRoutingRule, Error, SaveRoutingRuleInput>({
+    mutationFn: async (input: SaveRoutingRuleInput) => {
+      return await ipc.client.saas.saveRoutingRule(input);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.routingRules });
+    },
+  });
+}
+
+export function useDeleteRoutingRule() {
+  const queryClient = useQueryClient();
+  return useMutation<{ success: boolean; id: string }, Error, { id: string }>({
+    mutationFn: async ({ id }: { id: string }) => {
+      return await ipc.client.saas.deleteRoutingRule({ id });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.routingRules });
+    },
+  });
+}
+
+export function useSimulateRouting() {
+  return useMutation<
+    { selectedModel: string; selectedProvider: string; matchedRule?: string; fallbackChain: string[] },
+    Error,
+    { message: string; hasVision?: boolean; needsTools?: boolean; preset?: string }
+  >({
+    mutationFn: async (input) => {
+      return await ipc.client.saas.simulateRouting(input);
+    },
+  });
+}
+
+// --- Maintenance Hooks ---
+export function useSaasMaintenanceState() {
+  return useQuery<SaasMaintenanceState>({
+    queryKey: SAAS_QUERY_KEYS.maintenanceState,
+    queryFn: async () => {
+      return await ipc.client.saas.getMaintenanceState();
+    },
+    staleTime: 10000,
+    refetchInterval: 15000,
+  });
+}
+
+export function useSetGlobalMaintenance() {
+  const queryClient = useQueryClient();
+  return useMutation<SaasMaintenanceState, Error, SetGlobalMaintenanceInput>({
+    mutationFn: async (input: SetGlobalMaintenanceInput) => {
+      return await ipc.client.saas.setGlobalMaintenance(input);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.maintenanceState });
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.maintenanceHistory });
+    },
+  });
+}
+
+export function useSetDegradedMaintenance() {
+  const queryClient = useQueryClient();
+  return useMutation<SaasMaintenanceState, Error, SetDegradedMaintenanceInput>({
+    mutationFn: async (input: SetDegradedMaintenanceInput) => {
+      return await ipc.client.saas.setDegradedMaintenance(input);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.maintenanceState });
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.maintenanceHistory });
+    },
+  });
+}
+
+export function useSaasMaintenanceHistory() {
+  return useQuery<SaasMaintenanceHistoryItem[]>({
+    queryKey: SAAS_QUERY_KEYS.maintenanceHistory,
+    queryFn: async () => {
+      return await ipc.client.saas.listMaintenanceHistory();
+    },
+    staleTime: 15000,
+  });
+}
+
+export function useScheduleMaintenanceWindow() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    SaasMaintenanceWindow,
+    Error,
+    { startsAt: number; endsAt: number; bannerText: string; autoEnable?: boolean }
+  >({
+    mutationFn: async (input) => {
+      return await ipc.client.saas.scheduleMaintenanceWindow(input);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.maintenanceState });
+    },
+  });
+}
+
+export function useDeleteMaintenanceWindow() {
+  const queryClient = useQueryClient();
+  return useMutation<{ success: boolean; id: string }, Error, { id: string }>({
+    mutationFn: async ({ id }: { id: string }) => {
+      return await ipc.client.saas.deleteMaintenanceWindow({ id });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: SAAS_QUERY_KEYS.maintenanceState });
+    },
+  });
+}
+
+// --- Activity Hooks ---
+export function useSaasActivity(filter: ActivityFilterInput) {
+  return useQuery<ActivityResponse>({
+    queryKey: [...SAAS_QUERY_KEYS.activity, filter],
+    queryFn: async () => {
+      return await ipc.client.saas.listActivity(filter);
+    },
+    staleTime: 10000,
+    refetchInterval: 15000,
+  });
+}
+
+export function useExportActivityCsv() {
+  return useMutation<string, Error, ActivityFilterInput>({
+    mutationFn: async (filter: ActivityFilterInput) => {
+      return await ipc.client.saas.exportActivityCsv(filter);
+    },
+  });
+}
+
+// --- Usage & Analytics Hooks ---
+export function useSaasUsageMetrics(days: number = 30) {
+  return useQuery<UsageMetrics>({
+    queryKey: [...SAAS_QUERY_KEYS.usageMetrics, days],
+    queryFn: async () => {
+      return await ipc.client.saas.getUsageMetrics({ days });
+    },
+    staleTime: 30000,
   });
 }

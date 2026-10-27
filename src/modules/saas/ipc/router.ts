@@ -2,17 +2,30 @@ import { os } from '@orpc/server';
 import { z } from 'zod';
 import { saasService } from '../services/saas.service';
 import {
+  ActivityFilterInputSchema,
+  ActivityResponseSchema,
   CreatedSaasApiKeySchema,
   CreatePartnerInputSchema,
   PlaygroundRunInputSchema,
   PlaygroundRunOutputSchema,
   SaasAccessRequestSchema,
   SaasApiKeySchema,
+  SaasMaintenanceHistoryItemSchema,
+  SaasMaintenanceStateSchema,
+  SaasMaintenanceWindowSchema,
   SaasModelCatalogItemSchema,
   SaasPartnerSchema,
+  SaasProviderSchema,
+  SaasRoutingConfigSchema,
+  SaasRoutingRuleSchema,
   SaasUsageLogSchema,
   SaasUserSchema,
+  SaveProviderInputSchema,
+  SaveRoutingRuleInputSchema,
+  SetDegradedMaintenanceInputSchema,
+  SetGlobalMaintenanceInputSchema,
   SubmitAccessRequestInputSchema,
+  UsageMetricsSchema,
 } from '../types';
 
 export const saasRouter = os.router({
@@ -139,5 +152,159 @@ export const saasRouter = os.router({
     .output(PlaygroundRunOutputSchema)
     .handler(async ({ input }) => {
       return saasService.runPlayground(input);
+    }),
+
+  // --- Providers ---
+  listProviders: os
+    .output(z.array(SaasProviderSchema))
+    .handler(async () => {
+      return saasService.listProviders();
+    }),
+
+  saveProvider: os
+    .input(SaveProviderInputSchema)
+    .output(SaasProviderSchema)
+    .handler(async ({ input }) => {
+      return saasService.saveProvider(input);
+    }),
+
+  deleteProvider: os
+    .input(z.object({ id: z.string().min(1) }))
+    .output(z.object({ success: z.boolean(), id: z.string() }))
+    .handler(async ({ input }) => {
+      return saasService.deleteProvider(input.id);
+    }),
+
+  testProvider: os
+    .input(z.object({ id: z.string().min(1) }))
+    .output(z.object({ ok: z.boolean(), latencyMs: z.number(), error: z.string().optional() }))
+    .handler(async ({ input }) => {
+      return saasService.testProvider(input.id);
+    }),
+
+  // --- Routing & Fallback Chains ---
+  getRoutingConfig: os
+    .output(SaasRoutingConfigSchema)
+    .handler(async () => {
+      return saasService.getRoutingConfig();
+    }),
+
+  saveRoutingConfig: os
+    .input(SaasRoutingConfigSchema.partial())
+    .output(SaasRoutingConfigSchema)
+    .handler(async ({ input }) => {
+      return saasService.saveRoutingConfig(input);
+    }),
+
+  listRoutingRules: os
+    .output(z.array(SaasRoutingRuleSchema))
+    .handler(async () => {
+      return saasService.listRoutingRules();
+    }),
+
+  saveRoutingRule: os
+    .input(SaveRoutingRuleInputSchema)
+    .output(SaasRoutingRuleSchema)
+    .handler(async ({ input }) => {
+      return saasService.saveRoutingRule(input);
+    }),
+
+  deleteRoutingRule: os
+    .input(z.object({ id: z.string().min(1) }))
+    .output(z.object({ success: z.boolean(), id: z.string() }))
+    .handler(async ({ input }) => {
+      return saasService.deleteRoutingRule(input.id);
+    }),
+
+  simulateRouting: os
+    .input(
+      z.object({
+        message: z.string(),
+        hasVision: z.boolean().optional(),
+        needsTools: z.boolean().optional(),
+        preset: z.string().optional(),
+      }),
+    )
+    .output(
+      z.object({
+        selectedModel: z.string(),
+        selectedProvider: z.string(),
+        matchedRule: z.string().optional(),
+        fallbackChain: z.array(z.string()),
+      }),
+    )
+    .handler(async ({ input }) => {
+      return saasService.simulateRouting(input);
+    }),
+
+  // --- Maintenance Center ---
+  getMaintenanceState: os
+    .output(SaasMaintenanceStateSchema)
+    .handler(async () => {
+      return saasService.getMaintenanceState();
+    }),
+
+  setGlobalMaintenance: os
+    .input(SetGlobalMaintenanceInputSchema)
+    .output(SaasMaintenanceStateSchema)
+    .handler(async ({ input }) => {
+      return saasService.setGlobalMaintenance(input);
+    }),
+
+  setDegradedMaintenance: os
+    .input(SetDegradedMaintenanceInputSchema)
+    .output(SaasMaintenanceStateSchema)
+    .handler(async ({ input }) => {
+      return saasService.setDegradedMaintenance(input);
+    }),
+
+  listMaintenanceHistory: os
+    .output(z.array(SaasMaintenanceHistoryItemSchema))
+    .handler(async () => {
+      return saasService.listMaintenanceHistory();
+    }),
+
+  scheduleMaintenanceWindow: os
+    .input(
+      z.object({
+        startsAt: z.number(),
+        endsAt: z.number(),
+        bannerText: z.string(),
+        autoEnable: z.boolean().optional(),
+      }),
+    )
+    .output(SaasMaintenanceWindowSchema)
+    .handler(async ({ input }) => {
+      return saasService.scheduleMaintenanceWindow(input);
+    }),
+
+  deleteMaintenanceWindow: os
+    .input(z.object({ id: z.string().min(1) }))
+    .output(z.object({ success: z.boolean(), id: z.string() }))
+    .handler(async ({ input }) => {
+      return saasService.deleteMaintenanceWindow(input.id);
+    }),
+
+  // --- Activity Log ---
+  listActivity: os
+    .input(ActivityFilterInputSchema)
+    .output(ActivityResponseSchema)
+    .handler(async ({ input }) => {
+      return saasService.listActivity(input);
+    }),
+
+  exportActivityCsv: os
+    .input(ActivityFilterInputSchema)
+    .output(z.string())
+    .handler(async ({ input }) => {
+      return saasService.exportActivityCsv(input);
+    }),
+
+  // --- Usage & Analytics ---
+  getUsageMetrics: os
+    .input(z.object({ days: z.number().default(30) }).optional())
+    .output(UsageMetricsSchema)
+    .handler(async ({ input }) => {
+      return saasService.getUsageMetrics(input?.days ?? 30);
     }),
 });

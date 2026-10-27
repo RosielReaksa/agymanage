@@ -21,6 +21,11 @@ import {
   Terminal,
   Cpu,
   BookOpen,
+  Server,
+  GitFork,
+  ShieldAlert,
+  TrendingUp,
+  Radio,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -66,14 +71,29 @@ export const MainLayout: React.FC = () => {
       label: t('nav.playground', 'Playground'),
     },
     {
+      to: '/activity',
+      icon: Radio,
+      label: t('nav.activity', 'Gateway Activity'),
+    },
+    {
       to: '/models',
       icon: Cpu,
       label: t('nav.models', 'Models Catalog'),
     },
     {
-      to: '/docs',
-      icon: BookOpen,
-      label: t('nav.docs', 'Documentation'),
+      to: '/providers',
+      icon: Server,
+      label: t('nav.providers', 'AI Providers'),
+    },
+    {
+      to: '/routing',
+      icon: GitFork,
+      label: t('nav.routing', 'Smart Routing'),
+    },
+    {
+      to: '/usage',
+      icon: TrendingUp,
+      label: t('nav.usage', 'Usage & Costs'),
     },
     {
       to: '/partners',
@@ -87,6 +107,16 @@ export const MainLayout: React.FC = () => {
       badge: pendingRequestsCount > 0 ? pendingRequestsCount : undefined,
     },
     {
+      to: '/maintenance',
+      icon: ShieldAlert,
+      label: t('nav.maintenance', 'Maintenance'),
+    },
+    {
+      to: '/docs',
+      icon: BookOpen,
+      label: t('nav.docs', 'Documentation'),
+    },
+    {
       to: '/pool',
       icon: Layers,
       label: t('nav.pool', 'Provider Pool'),
@@ -94,7 +124,7 @@ export const MainLayout: React.FC = () => {
     {
       to: '/proxy',
       icon: Network,
-      label: t('nav.proxy', 'Proxy Routing'),
+      label: t('nav.proxy', 'Proxy Gateway'),
     },
     {
       to: '/traffic',
