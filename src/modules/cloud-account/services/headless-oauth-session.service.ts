@@ -1,0 +1,374 @@
+import crypto from 'node:crypto';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import { GoogleAPIService } from './GoogleAPIService';
+import {
+  DuplicateGoogleAccountError,
+  enrollGoogleAccount,
+} from './google-account-enrollment.service';
+import { logger } from '@/shared/logging/logger';
+import { UPSTREAM_PROXY_CONFIGURATION_MESSAGE } from '@/modules/config/upstream-proxy.schema';
+import { GoogleLoginOperation } from './google-login-operation';
+import { DesktopOAuthLoginError } from './desktop-oauth-login.error';
+import type { DesktopOAuthLoginErrorCode } from './desktop-oauth-login.schema';
+import type { GoogleLoginDiagnostic } from './operation-diagnostic.schema';
+import { classifyOperationCause } from './operation-cause';
+
+const LOOPBACK_HOST = '127.0.0.1';
+const SESSION_TIMEOUT_MS = 5 * 60_000;
+
+export class OAuthLoginActiveError extends Error {
+  constructor(readonly diagnostic?: GoogleLoginDiagnostic) {
+    super('An OAuth login is already in progress');
+    this.name = 'OAuthLoginActiveError';
+  }
+}
+
+export type HeadlessOAuthStatus =
+  | { state: 'pending' }
+  | { state: 'succeeded'; account: { id: string; email: string } }
+  | {
+      state: 'failed';
+      message: string;
+      loginCode: DesktopOAuthLoginErrorCode;
+      diagnostic: GoogleLoginDiagnostic;
+    };
+
+interface OAuthSession {
+  operation: GoogleLoginOperation;
+  id: string;
+  state: string;
+  redirectUri: string;
+  clientKey?: string;
+  server: FastifyInstance;
+  timer: NodeJS.Timeout | null;
+  consumed: boolean;
+  status: HeadlessOAuthStatus;
+  enrollment: Promise<void> | null;
+  closing: Promise<void> | null;
+}
+
+export class HeadlessOAuthSessionService {
+  private session: OAuthSession | null = null;
+  private readonly completed = new Map<string, HeadlessOAuthStatus>();
+  private starting: Promise<{
+    sessionId: string;
+    authorizationUrl: string;
+    diagnosticId: string;
+  }> | null = null;
+  private stopping = false;
+
+  constructor(
+    private readonly enroll: typeof enrollGoogleAccount = enrollGoogleAccount,
+    private readonly reloadGatewayAccounts: () => Promise<boolean> = async () => false,
+    private readonly timeoutMs: number = SESSION_TIMEOUT_MS,
+  ) {}
+
+  async start(
+    oauthClientKey?: string,
+    operation = new GoogleLoginOperation(),
+  ): Promise<{ sessionId: string; authorizationUrl: string; diagnosticId: string }> {
+    if (this.stopping) {
+      throw new DesktopOAuthLoginError(
+        'login-cancelled',
+        operation.finish(undefined, 'cancelled', true),
+      );
+    }
+    if (this.starting || this.session?.status.state === 'pending') {
+      throw new OAuthLoginActiveError(operation.finish(undefined, 'login-active', true));
+    }
+
+    const starting = operation.context.run(() => this.startSession(oauthClientKey, operation));
+    this.starting = starting;
+    try {
+      return await starting;
+    } finally {
+      this.starting = null;
+    }
+  }
+
+  private async startSession(
+    oauthClientKey?: string,
+    operation = new GoogleLoginOperation(),
+  ): Promise<{ sessionId: string; authorizationUrl: string; diagnosticId: string }> {
+    const clientKey = oauthClientKey ?? GoogleAPIService.getActiveOAuthClientKey();
+    const session: OAuthSession = {
+      operation,
+      id: crypto.randomUUID(),
+      state: crypto.randomBytes(32).toString('base64url'),
+      redirectUri: '',
+      clientKey,
+      server: Fastify({ logger: false, forceCloseConnections: true }),
+      timer: null,
+      consumed: false,
+      status: { state: 'pending' },
+      enrollment: null,
+      closing: null,
+    };
+    session.server.addHook('onRequest', async (request, reply) => {
+      if (request.method !== 'GET') {
+        return reply.header('Allow', 'GET').code(405).send('Method Not Allowed');
+      }
+    });
+    session.server.get('/oauth-callback', (request, reply) =>
+      this.handleCallback(session, request, reply),
+    );
+    await operation.run('callback-listen', () =>
+      session.server.listen({ port: 0, host: LOOPBACK_HOST }),
+    );
+
+    const address = session.server.server.address();
+    if (!address || typeof address === 'string') {
+      await this.closeListener(session);
+      throw new Error('OAuth callback listener has no TCP port');
+    }
+    session.redirectUri = `http://${LOOPBACK_HOST}:${address.port}/oauth-callback`;
+    try {
+      if (this.stopping) {
+        throw new DesktopOAuthLoginError(
+          'login-cancelled',
+          operation.finish(undefined, 'cancelled', true),
+        );
+      }
+      const authorizationUrl = await operation.run('authorization-url', () =>
+        GoogleAPIService.getAuthUrl(clientKey, {
+          redirectUri: session.redirectUri,
+          state: session.state,
+        }),
+      );
+      this.session = session;
+      session.timer = setTimeout(() => {
+        this.fail(session, 'login-timeout', 'OAuth login timed out', undefined, 'timed-out');
+      }, this.timeoutMs);
+      session.timer.unref();
+      operation.enter('authorization');
+      return {
+        sessionId: session.id,
+        authorizationUrl,
+        diagnosticId: operation.context.diagnosticId,
+      };
+    } catch (error) {
+      await this.closeListener(session);
+      throw error;
+    }
+  }
+
+  status(sessionId: string): HeadlessOAuthStatus | null {
+    return this.session?.id === sessionId
+      ? this.session.status
+      : (this.completed.get(sessionId) ?? null);
+  }
+
+  completeCode(sessionId: string, code: string): boolean {
+    const session = this.session;
+    if (
+      this.stopping ||
+      !session ||
+      session.id !== sessionId ||
+      session.consumed ||
+      session.status.state !== 'pending'
+    ) {
+      return false;
+    }
+    session.consumed = true;
+    this.clearTimer(session);
+    session.enrollment = session.operation.context.run(() => this.complete(session, code));
+    return true;
+  }
+
+  private handleCallback(
+    session: OAuthSession,
+    request: FastifyRequest,
+    response: FastifyReply,
+  ): void {
+    const url = new URL(request.url, session.redirectUri);
+    if (url.searchParams.get('state') !== session.state) {
+      response.code(400).send('Invalid authorization state');
+      return;
+    }
+    if (this.stopping) {
+      response.code(503).send('OAuth login is unavailable');
+      return;
+    }
+    if (session.consumed || session.status.state !== 'pending') {
+      response.code(409).send('Authorization already handled');
+      return;
+    }
+    if (url.searchParams.has('error')) {
+      session.consumed = true;
+      response.raw.once('finish', () =>
+        this.fail(
+          session,
+          'authorization-denied',
+          'Google authorization was denied',
+          undefined,
+          'authorization-denied',
+        ),
+      );
+      response.code(400).send('Authorization denied. Return to the terminal.');
+      return;
+    }
+    const code = url.searchParams.get('code');
+    if (!code) {
+      response.code(400).send('Missing authorization code');
+      return;
+    }
+
+    session.consumed = true;
+    this.clearTimer(session);
+    const enrollment = Promise.withResolvers<void>();
+    session.enrollment = enrollment.promise;
+    // Release the browser response before closing the listener and exchanging the code.
+    response.raw.once('finish', () => {
+      if (this.stopping) {
+        this.fail(session, 'login-cancelled', 'OAuth login was cancelled', undefined, 'cancelled');
+        enrollment.resolve();
+        return;
+      }
+      session.operation.context.run(() => this.complete(session, code)).then(enrollment.resolve);
+    });
+    response.raw.once('close', () => {
+      if (!response.raw.writableFinished) {
+        this.fail(
+          session,
+          'login-failed',
+          'OAuth callback connection closed',
+          undefined,
+          'network-failed',
+        );
+        enrollment.resolve();
+      }
+    });
+    response.code(200).type('text/html; charset=utf-8').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Login Successful</title></head>
+<body style="font-family:sans-serif;text-align:center;padding-top:50px">
+<h1>Login Successful</h1>
+<p>You can close this window and return to Antigravity Manager.</p>
+<script>setTimeout(() => window.close(), 3000);</script>
+</body></html>`);
+  }
+
+  private async complete(session: OAuthSession, code: string): Promise<void> {
+    try {
+      await this.closeListener(session);
+      const account = await this.enroll(code, {
+        oauthClientKey: session.clientKey,
+        redirectUri: session.redirectUri,
+        operation: session.operation,
+      });
+      try {
+        await this.reloadGatewayAccounts();
+      } catch {
+        logger.warn('Headless OAuth account was saved but gateway cache refresh failed');
+      }
+      session.status = { state: 'succeeded', account: { id: account.id, email: account.email } };
+      this.remember(session);
+      this.clearTimer(session);
+    } catch (error) {
+      const proxyInvalid =
+        classifyOperationCause(error).primary.reason === 'proxy-configuration-invalid';
+      this.fail(
+        session,
+        error instanceof DuplicateGoogleAccountError
+          ? 'duplicate-account'
+          : proxyInvalid
+            ? 'proxy-configuration-invalid'
+            : 'login-failed',
+        error instanceof DuplicateGoogleAccountError
+          ? 'Google account already exists'
+          : proxyInvalid
+            ? UPSTREAM_PROXY_CONFIGURATION_MESSAGE
+            : 'Google account enrollment failed',
+        error,
+        error instanceof DuplicateGoogleAccountError ? 'duplicate-account' : undefined,
+      );
+    }
+  }
+
+  private fail(
+    session: OAuthSession,
+    loginCode: DesktopOAuthLoginErrorCode,
+    message: string,
+    error?: unknown,
+    reason?: GoogleLoginDiagnostic['reason'],
+  ): void {
+    if (session.status.state !== 'pending') {
+      return;
+    }
+    const expected = [
+      'duplicate-account',
+      'authorization-denied',
+      'login-cancelled',
+      'login-active',
+    ].includes(loginCode);
+    if (error === undefined) {
+      session.operation.enter('authorization');
+    }
+    session.status = {
+      state: 'failed',
+      message,
+      loginCode,
+      diagnostic: session.operation.finish(error, reason, expected),
+    };
+    this.remember(session);
+    this.clearTimer(session);
+    this.closeListener(session).catch((error: unknown) => {
+      logger.warn('Failed to close OAuth callback listener', error);
+    });
+  }
+
+  private clearTimer(session: OAuthSession): void {
+    if (session.timer) {
+      clearTimeout(session.timer);
+      session.timer = null;
+    }
+  }
+
+  private remember(session: OAuthSession): void {
+    this.completed.set(session.id, session.status);
+    if (this.completed.size > 8) {
+      const oldest = this.completed.keys().next().value;
+      if (oldest) {
+        this.completed.delete(oldest);
+      }
+    }
+  }
+
+  private async closeListener(session: OAuthSession): Promise<void> {
+    if (session.closing) {
+      return session.closing;
+    }
+    if (!session.server.server.listening) {
+      return;
+    }
+    session.closing = session.server.close().then(() => undefined);
+    await session.closing;
+  }
+
+  async cancel(sessionId: string): Promise<void> {
+    const session = this.session;
+    if (!session || session.id !== sessionId || session.enrollment) {
+      return;
+    }
+    this.fail(session, 'login-cancelled', 'OAuth login was cancelled', undefined, 'cancelled');
+    await this.closeListener(session);
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.starting) {
+      await this.starting.catch(() => undefined);
+    }
+    const session = this.session;
+    if (!session) {
+      return;
+    }
+    if (session.enrollment) {
+      await session.enrollment;
+    }
+    if (session.status.state === 'pending') {
+      this.fail(session, 'login-cancelled', 'OAuth login was cancelled', undefined, 'cancelled');
+    }
+    this.clearTimer(session);
+    await this.closeListener(session);
+  }
+}

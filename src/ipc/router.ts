@@ -1,0 +1,205 @@
+import { accountRouter, databaseRouter } from '@/modules/account/ipc/router';
+import {
+  cloudRouter,
+  type CloudAccountSwitchORPCErrorData,
+  type LocalAccountImportORPCErrorData,
+  parseCloudAccountSwitchORPCErrorData,
+  parseLocalAccountImportORPCErrorData,
+  parseDesktopOAuthLoginErrorData,
+  type DesktopOAuthLoginErrorData,
+} from '@/modules/cloud-account/ipc/router';
+import { configRouter } from '@/modules/config/ipc/router';
+import { gatewayAuditMiddleware, gatewayRouter } from '@/modules/proxy-gateway/ipc/router';
+import { antigravityRuntimeRouter } from '@/modules/antigravity-runtime/ipc/router';
+import { appShellRouter } from '@/modules/app-shell/ipc/router';
+import { saasRouter } from '@/modules/saas/ipc/router';
+
+import { ORPCError, os } from '@orpc/server';
+import { isString } from 'lodash-es';
+import { z } from 'zod';
+import { logger } from '../shared/logging/logger';
+import { AppError, getAppErrorData, type AppErrorData } from '@/shared/errors/appError';
+import { projectOwnerOperationError, type OwnerOperationErrorData } from './owner-operation-error';
+import { desktopRpcAdmission } from './admission';
+
+interface BackendErrorDetails {
+  backendCode?: string;
+  backendStatus?: number;
+  backendName: string;
+  backendMessage: string;
+  backendStack?: string;
+  backendValue?: string;
+  diagnosticCode?: CloudAccountSwitchORPCErrorData['switchCode'];
+  requestPath: string;
+}
+
+/** A closed IPC error envelope with only explicitly validated feature extensions. */
+type PublicORPCErrorData =
+  | OwnerOperationErrorData
+  | BackendErrorDetails
+  | (BackendErrorDetails & AppErrorData)
+  | (BackendErrorDetails & CloudAccountSwitchORPCErrorData)
+  | (BackendErrorDetails & DesktopOAuthLoginErrorData)
+  | (BackendErrorDetails & LocalAccountImportORPCErrorData);
+
+function stringifyUnknownError(error: unknown): string {
+  if (isString(error)) {
+    return error;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function createBackendErrorDetails(error: unknown, requestPath: string): BackendErrorDetails {
+  const message = stringifyUnknownError(error);
+
+  if (error instanceof ORPCError) {
+    return {
+      backendCode: error.code,
+      backendStatus: error.status,
+      backendName: error.name,
+      backendMessage: message,
+      backendStack: error.stack,
+      requestPath,
+    };
+  }
+
+  if (error instanceof Error) {
+    return {
+      backendName: error.name,
+      backendMessage: message,
+      backendStack: error.stack,
+      requestPath,
+    };
+  }
+
+  return {
+    backendName: typeof error,
+    backendMessage: message,
+    backendValue: message,
+    requestPath,
+  };
+}
+
+function createPublicORPCErrorData(error: unknown, requestPath: string): PublicORPCErrorData {
+  const backendDetails = createBackendErrorDetails(error, requestPath);
+  const appErrorData = getAppErrorData(error);
+  if (appErrorData) {
+    return {
+      ...backendDetails,
+      ...appErrorData,
+    };
+  }
+
+  const switchErrorData =
+    error instanceof ORPCError ? parseCloudAccountSwitchORPCErrorData(error.data) : null;
+  if (switchErrorData) {
+    if (switchErrorData.diagnostic) {
+      delete backendDetails.backendStack;
+    }
+    return {
+      ...backendDetails,
+      ...switchErrorData,
+      diagnosticCode: switchErrorData.switchCode,
+    };
+  }
+
+  const loginErrorData =
+    error instanceof ORPCError ? parseDesktopOAuthLoginErrorData(error.data) : null;
+  if (loginErrorData) {
+    if (loginErrorData.diagnostic) {
+      delete backendDetails.backendStack;
+    }
+    return { ...backendDetails, ...loginErrorData };
+  }
+
+  const localAccountImportErrorData =
+    error instanceof ORPCError ? parseLocalAccountImportORPCErrorData(error.data) : null;
+  if (localAccountImportErrorData) {
+    return {
+      ...backendDetails,
+      ...localAccountImportErrorData,
+    };
+  }
+
+  return backendDetails;
+}
+
+export function toPublicORPCError(
+  error: unknown,
+  requestPath: string,
+): ORPCError<string, PublicORPCErrorData> {
+  const ownerError = projectOwnerOperationError(error, requestPath);
+  if (ownerError) {
+    return ownerError;
+  }
+  const message = stringifyUnknownError(error);
+  const publicData = createPublicORPCErrorData(error, requestPath);
+
+  if (error instanceof AppError) {
+    return new ORPCError(error.transportCode, {
+      message,
+      data: publicData,
+    });
+  }
+
+  if (error instanceof ORPCError) {
+    return new ORPCError(error.code, {
+      message,
+      data: publicData,
+    });
+  }
+
+  return new ORPCError('INTERNAL_SERVER_ERROR', {
+    message,
+    data: publicData,
+  });
+}
+
+// Log middleware setup
+const logMiddleware = os.middleware(async ({ next, path }) => {
+  const requestPath = JSON.stringify(path || 'unknown');
+  try {
+    return await next({});
+  } catch (err) {
+    const ownerError = projectOwnerOperationError(err, requestPath);
+    const publicError = ownerError ?? toPublicORPCError(err, requestPath);
+    const featureDiagnostic =
+      err instanceof ORPCError
+        ? (parseDesktopOAuthLoginErrorData(err.data)?.diagnostic ??
+          parseCloudAccountSwitchORPCErrorData(err.data)?.diagnostic)
+        : null;
+    logger.error(
+      `[ORPC] Error in handler for ${requestPath}:`,
+      featureDiagnostic ? publicError : ownerError ? ownerError.data : err,
+    );
+    throw publicError;
+  }
+});
+
+// Explicit Router Definition
+export const router = os
+  .use(os.middleware(({ next }) => desktopRpcAdmission.run(async () => next({}))))
+  .use(logMiddleware)
+  .use(gatewayAuditMiddleware)
+  .router({
+    ping: os.output(z.string()).handler(async () => 'pong'),
+
+    ...appShellRouter,
+    database: databaseRouter,
+    ...antigravityRuntimeRouter,
+
+    account: accountRouter,
+    cloud: cloudRouter,
+    config: configRouter,
+    gateway: gatewayRouter,
+    saas: saasRouter,
+  });

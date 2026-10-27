@@ -1,0 +1,1203 @@
+import type { CloudQuotaModelInfo } from '@/modules/cloud-account/types';
+import type { CloudAccountView } from '@/modules/cloud-account/services/cloud-account-view';
+import { Button } from '@/components/ui/button';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { cn } from '@/shared/ui/utils';
+
+import {
+  MoreVertical,
+  Trash,
+  RefreshCw,
+  Box,
+  Power,
+  Fingerprint,
+  Eye,
+  EyeOff,
+  Repeat2,
+  Terminal,
+  TriangleAlert,
+  ExternalLink,
+  ChevronDown,
+} from 'lucide-react';
+import { formatAccountLastUsed } from '@/modules/cloud-account/utils/format-last-used';
+import { Badge } from '@/components/ui/badge';
+import { useTranslation } from 'react-i18next';
+import { useAppConfig } from '@/modules/config/hooks/useAppConfig';
+import { useProviderGrouping } from '@/modules/cloud-account/hooks/useProviderGrouping';
+import { ProviderGroup } from '@/modules/cloud-account/components/ProviderGroup';
+import {
+  clampQuotaPercentage,
+  formatAiCreditsAmount,
+  formatResetTimeLabel,
+  formatResetTimeTitle,
+  getQuotaStatus,
+} from '@/modules/cloud-account/utils/quota-display';
+import { useState } from 'react';
+import { useAccountModelAvailability } from '../hooks/useAccountModelAvailability';
+import { ipc } from '@/ipc/manager';
+import { CloudAccountProxyDialog } from '@/modules/cloud-account/components/CloudAccountProxyDialog';
+import { getCloudAccountBlockedStatusLabel } from '@/modules/cloud-account/utils/accountValidationStatus';
+import type { AntigravityAppTarget } from '@/shared/platform/antigravityAppTarget';
+import { AccountTierBadge } from '@/modules/cloud-account/components/AccountTierBadge';
+import { CloudAccountClientStatus } from './CloudAccountClientStatus';
+import {
+  DEFAULT_QUOTA_GROUP_VISIBILITY,
+  getVisibleAccountQuota,
+  type QuotaGroupVisibility,
+} from '@/modules/cloud-account/utils/quota-group-visibility';
+import type { QuotaWindow } from '@/modules/cloud-account/utils/quota-groups';
+import { DetailedQuotaDisplay } from '@/modules/cloud-account/components/DetailedQuotaDisplay';
+import { AccountQuotaWindowSections } from '@/modules/cloud-account/components/AccountQuotaWindowSections';
+import {
+  CompactModelQuotaDisplay,
+  type CompactModelQuotaItem,
+} from '@/modules/cloud-account/components/CompactModelQuotaDisplay';
+import { ManualRecommendationBadge } from '@/modules/cloud-account/components/ManualRecommendationBadge';
+import type { ManualRecommendationContext } from '@/modules/cloud-account/utils/manual-account-recommendation';
+import { QUOTA_TEXT_COLOR_CLASS_BY_STATUS, QUOTA_BAR_COLOR_CLASS_BY_STATUS } from './quota-colors';
+import { isWeeklyQuotaBucket } from '@/modules/cloud-account/utils/quota-groups';
+import { useOpenAccountValidationLink } from '@/modules/cloud-account/hooks/useOpenAccountValidationLink';
+import {
+  isGeminiWeeklyQuotaItem,
+  isClaudeOrGptWeeklyQuotaItem,
+  isGeminiQuotaGroup,
+  isClaudeOrGptQuotaGroup,
+} from '@/modules/cloud-account/utils/minimal-mode-preference';
+
+type ModelQuotaEntry = [string, CloudQuotaModelInfo];
+type LiveModelAvailability = Awaited<
+  ReturnType<typeof ipc.client.gateway.modelAvailability>
+>[number];
+
+const GEMINI_LEGACY_MODEL_PATTERN = /gemini-[12](\.|$|-)/i;
+const GEMINI_PRO_COMBINED_MODEL_ID = 'gemini-3.1-pro-low/high';
+
+const MODEL_DISPLAY_REPLACEMENTS: Array<[string, string]> = [
+  [GEMINI_PRO_COMBINED_MODEL_ID, 'Gemini 3.1 Pro (Low/High)'],
+  ['gemini-3.1-pro-preview', 'Gemini 3.1 Pro Preview'],
+  ['gemini-3-pro-image', 'Gemini 3 Pro Image'],
+  ['gemini-3.1-pro', 'Gemini 3.1 Pro'],
+  ['gemini-3-pro', 'Gemini 3 Pro'],
+  ['gemini-3-flash', 'Gemini 3 Flash'],
+  ['claude-sonnet-4-6-thinking', 'Claude 4.6 Sonnet (Thinking)'],
+  ['claude-sonnet-4-6', 'Claude 4.6 Sonnet'],
+  ['claude-sonnet-4-5-thinking', 'Claude 4.5 Sonnet (Thinking)'],
+  ['claude-sonnet-4-5', 'Claude 4.5 Sonnet'],
+  ['claude-opus-4-6-thinking', 'Claude 4.6 Opus (Thinking)'],
+  ['claude-opus-4-5-thinking', 'Claude 4.5 Opus (Thinking)'],
+  ['claude-3-5-sonnet', 'Claude 3.5 Sonnet'],
+];
+
+function formatCreditsExpiry(expiryDate: string): string {
+  if (!expiryDate) {
+    return '';
+  }
+
+  try {
+    const date = new Date(expiryDate);
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  } catch {
+    return expiryDate;
+  }
+}
+
+function formatModelDisplayName(modelName: string): string {
+  let displayName = modelName.replace('models/', '');
+  for (const [source, target] of MODEL_DISPLAY_REPLACEMENTS) {
+    displayName = displayName.replace(source, target);
+  }
+
+  return displayName
+    .replace(/-/g, ' ')
+    .split(' ')
+    .map((word) => (word.length > 2 ? word.charAt(0).toUpperCase() + word.slice(1) : word))
+    .join(' ');
+}
+
+function formatCompactDuration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+  return `${remainingSeconds}s`;
+}
+
+function getAvailabilityModelCandidates(modelName: string): Set<string> {
+  const normalized = modelName.replace(/^models\//i, '').toLowerCase();
+  const candidates = new Set([normalized]);
+
+  if (
+    normalized === GEMINI_PRO_COMBINED_MODEL_ID ||
+    normalized === 'gemini-3.1-pro' ||
+    normalized === 'gemini-3.1-pro-high' ||
+    normalized === 'gemini-3-pro-high'
+  ) {
+    candidates.add('gemini-pro-agent');
+    candidates.add('gemini-3.1-pro-low');
+    candidates.add('gemini-3.1-pro-high');
+    candidates.add('gemini-3.1-pro-preview');
+    candidates.add('gemini-3-pro-preview');
+  }
+
+  if (normalized === 'gemini-3.5-flash') {
+    candidates.add('gemini-3.5-flash-extra-low');
+    candidates.add('gemini-3.5-flash-low');
+    candidates.add('gemini-3-flash-agent');
+  }
+
+  if (normalized === 'gemini-4-argon') {
+    candidates.add('gemini-4-argon-low');
+    candidates.add('gemini-4-argon-medium');
+    candidates.add('gemini-4-argon-high');
+  }
+
+  if (normalized === 'gemini-3.8-flash') {
+    candidates.add('gemini-3.8-flash-low');
+    candidates.add('gemini-3.8-flash-medium');
+    candidates.add('gemini-3.8-flash-high');
+  }
+
+  if (normalized === 'gemini-3.7-flash') {
+    candidates.add('gemini-3.7-flash-low');
+    candidates.add('gemini-3.7-flash-medium');
+    candidates.add('gemini-3.7-flash-high');
+    candidates.add('gemini-3.7-flash-tiered');
+    candidates.add('gemini-3.6-flash');
+    candidates.add('gemini-3.6-flash-low');
+    candidates.add('gemini-3.6-flash-medium');
+    candidates.add('gemini-3.6-flash-high');
+    candidates.add('gemini-3.6-flash-tiered');
+  }
+
+  if (normalized === 'gemini-3.1-flash-image' || normalized === 'gemini-3-flash-image') {
+    candidates.add('gemini-3.1-flash-image');
+    candidates.add('gemini-3-flash-image');
+  }
+
+  if (normalized === 'gemini-3-pro-image' || normalized === 'gemini-3.1-pro-image') {
+    candidates.add('gemini-3-pro-image');
+    candidates.add('gemini-3.1-pro-image');
+  }
+
+  return candidates;
+}
+
+function findModelAvailability(
+  availabilityEntries: LiveModelAvailability[],
+  accountId: string,
+  modelName: string,
+): LiveModelAvailability | undefined {
+  const candidates = getAvailabilityModelCandidates(modelName);
+  return availabilityEntries
+    .filter(
+      (entry) =>
+        entry.accountId === accountId &&
+        candidates.has(entry.modelId.replace(/^models\//i, '').toLowerCase()),
+    )
+    .sort((left, right) => right.detectedAt - left.detectedAt)[0];
+}
+
+interface CloudAccountCardProps {
+  account: CloudAccountView;
+  quotaWindow?: QuotaWindow;
+  quotaGroupVisibility?: QuotaGroupVisibility;
+  isMinimalMode?: boolean;
+  onRefresh: (id: string) => void;
+  onDelete: (id: string) => void;
+  onSwitch: (id: string, appTarget?: AntigravityAppTarget) => void;
+  onManageIdentity: (id: string) => void;
+  isSelected?: boolean;
+  onToggleSelection?: (id: string, selected: boolean) => void;
+  isRefreshing?: boolean;
+  isDeleting?: boolean;
+  isSwitching?: boolean;
+  recommendationContext?: ManualRecommendationContext;
+}
+
+export function CloudAccountCard({
+  account,
+  quotaWindow = 'both',
+  quotaGroupVisibility = DEFAULT_QUOTA_GROUP_VISIBILITY,
+  isMinimalMode = false,
+  onRefresh,
+  onDelete,
+  onSwitch,
+  onManageIdentity,
+  isSelected = false,
+  onToggleSelection,
+  isRefreshing,
+  isDeleting,
+  isSwitching,
+  recommendationContext,
+}: CloudAccountCardProps) {
+  const { t, i18n } = useTranslation();
+  const validationLink = useOpenAccountValidationLink();
+  const { config, saveConfig } = useAppConfig();
+  const {
+    enabled: providerGroupingsEnabled,
+    getAccountStats,
+    isProviderCollapsed,
+    toggleProviderCollapse,
+  } = useProviderGrouping();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const modelAvailability = useAccountModelAvailability(account.id);
+
+  const getQuotaTextColorClass = (percentage: number) => {
+    const quotaStatus = getQuotaStatus(percentage);
+    return QUOTA_TEXT_COLOR_CLASS_BY_STATUS[quotaStatus];
+  };
+
+  const getQuotaBarColorClass = (percentage: number) => {
+    const quotaStatus = getQuotaStatus(percentage);
+    return QUOTA_BAR_COLOR_CLASS_BY_STATUS[quotaStatus];
+  };
+
+  const formatQuotaLabel = (percentage: number) => {
+    if (percentage === 0) {
+      return t('cloud.card.rateLimitedQuota');
+    }
+    return `${percentage}%`;
+  };
+
+  const formatResetTimeLabelText = (resetTime?: string) => {
+    return formatResetTimeLabel(resetTime, {
+      prefix: t('cloud.card.resetPrefix'),
+      unknown: t('cloud.card.resetUnknown'),
+    });
+  };
+
+  const formatResetTimeTitleText = (resetTime?: string) => {
+    return formatResetTimeTitle(resetTime, t('cloud.card.resetTime'));
+  };
+
+  const allModelEntries = Object.entries(account.quota?.models || {}) as ModelQuotaEntry[];
+
+  const {
+    models: mergedModelQuotas,
+    providerModels,
+    groups: detailedGroups,
+    weeklyItems: weeklyQuotaItems,
+    fiveHourHidden,
+    weeklyHidden,
+  } = getVisibleAccountQuota(account.quota, config?.model_visibility ?? {}, quotaGroupVisibility);
+
+  const geminiModels = Object.entries(mergedModelQuotas)
+    .filter(([name]) => name.includes('gemini') && !GEMINI_LEGACY_MODEL_PATTERN.test(name))
+    .sort((a, b) => b[1].percentage - a[1].percentage);
+
+  const claudeModels = Object.entries(mergedModelQuotas)
+    .filter(([name]) => name.includes('claude'))
+    .sort((a, b) => b[1].percentage - a[1].percentage);
+
+  const hasVisibleQuotaModels = geminiModels.length > 0 || claudeModels.length > 0;
+  const hasDetailedQuota = detailedGroups.some((group) =>
+    group.buckets.some((bucket) => !isWeeklyQuotaBucket(bucket)),
+  );
+
+  const renderQuotaModelGroup = (title: string, models: ModelQuotaEntry[]) => {
+    if (models.length === 0) return null;
+    return (
+      <div key={title} className="space-y-1">
+        <div className="flex items-center gap-1.5 px-2 py-1">
+          <span className="text-muted-foreground/70 text-[10px] font-bold tracking-wider uppercase">
+            {title}
+          </span>
+          <div className="bg-border/50 h-px flex-1" />
+        </div>
+        {models.map(([modelName, info]) => {
+          const availability = findModelAvailability(modelAvailability, account.id, modelName);
+          const now = Date.now();
+          const isLiveLimitActive = !!availability && availability.unavailableUntil > now;
+          const statusLabel = availability?.status ? `HTTP ${availability.status}` : 'ERR';
+          const reasonLabel =
+            availability?.reason === 'model_not_supported'
+              ? t('cloud.card.liveLimitModelNotSupported', 'Model not supported')
+              : availability?.reason === 'model_forbidden'
+                ? t('cloud.card.liveLimitModelForbidden', 'Model forbidden')
+                : availability?.reason === 'quota_exhausted'
+                  ? t('cloud.card.liveLimitQuotaExhausted', 'Quota exhausted')
+                  : t('cloud.card.liveLimitRateLimited', 'Rate limited');
+          const liveLimitTimingLabel = availability
+            ? isLiveLimitActive
+              ? t('cloud.card.liveLimitRemaining', '{{duration}} remaining', {
+                  duration: formatCompactDuration(availability.unavailableUntil - now),
+                })
+              : t('cloud.card.liveLimitDetectedAgo', 'detected {{duration}} ago', {
+                  duration: formatCompactDuration(now - availability.detectedAt),
+                })
+            : null;
+          const availabilityTitle = availability
+            ? [
+                isLiveLimitActive
+                  ? t(
+                      'cloud.card.liveLimitActiveTitle',
+                      'The live upstream endpoint is temporarily unavailable.',
+                    )
+                  : t(
+                      'cloud.card.liveLimitRecentTitle',
+                      'The live upstream endpoint recently returned an error.',
+                    ),
+                `${statusLabel}: ${reasonLabel}.`,
+                t(
+                  'cloud.card.liveLimitQuotaSnapshot',
+                  'The quota snapshot can still show {{percentage}}%.',
+                  { percentage: info.percentage },
+                ),
+                availability.message
+                  ? t('cloud.card.liveLimitMessage', 'Message: {{message}}', {
+                      message: availability.message,
+                    })
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(' ')
+            : modelName;
+          return (
+            <div
+              key={modelName}
+              className={cn(
+                'group/item hover:bg-muted/60 hover:border-border/60 grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-lg border border-transparent px-2 py-1.5 text-sm transition-all',
+                availability &&
+                  'border-amber-400/60 bg-amber-50/70 ring-1 ring-amber-400/20 dark:border-amber-500/60 dark:bg-amber-950/25',
+                isLiveLimitActive &&
+                  'border-rose-400/70 bg-rose-50/80 ring-rose-400/25 dark:border-rose-500/70 dark:bg-rose-950/30',
+              )}
+              title={availabilityTitle}
+            >
+              <div className="min-w-0">
+                <span
+                  className={cn(
+                    'text-muted-foreground group-hover/item:text-foreground flex min-w-0 items-center gap-1 truncate font-semibold',
+                    availability && 'text-amber-700 dark:text-amber-300',
+                    isLiveLimitActive && 'text-rose-700 dark:text-rose-300',
+                  )}
+                >
+                  {availability && (
+                    <TriangleAlert
+                      className={cn(
+                        'size-3 shrink-0 text-amber-500',
+                        isLiveLimitActive && 'text-rose-500',
+                      )}
+                      aria-hidden="true"
+                    />
+                  )}
+                  <span className="truncate">{formatModelDisplayName(modelName)}</span>
+                </span>
+                {availability && liveLimitTimingLabel && (
+                  <span
+                    className={cn(
+                      'mt-0.5 block truncate text-[9px] leading-tight text-amber-700/80 dark:text-amber-300/80',
+                      isLiveLimitActive && 'text-rose-700/80 dark:text-rose-300/80',
+                    )}
+                  >
+                    {reasonLabel} · {liveLimitTimingLabel}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-col items-end gap-0.5">
+                <span
+                  className="text-muted-foreground text-[9px] leading-none opacity-80"
+                  title={formatResetTimeTitleText(info.resetTime)}
+                >
+                  {formatResetTimeLabelText(info.resetTime)}
+                </span>
+                <div className="flex items-baseline gap-1">
+                  {availability && (
+                    <span
+                      className={cn(
+                        'rounded bg-amber-500/15 px-1 py-px font-mono text-[9px] leading-none font-bold text-amber-700 dark:text-amber-300',
+                        isLiveLimitActive && 'bg-rose-500/15 text-rose-700 dark:text-rose-300',
+                      )}
+                    >
+                      {statusLabel}
+                    </span>
+                  )}
+                  <span
+                    className={cn(
+                      'font-mono text-xs leading-none font-bold',
+                      availability
+                        ? isLiveLimitActive
+                          ? 'text-rose-700 dark:text-rose-300'
+                          : 'text-amber-700 dark:text-amber-300'
+                        : getQuotaTextColorClass(info.percentage),
+                    )}
+                  >
+                    {info.percentage}%
+                  </span>
+                  <div className="bg-muted/70 border-border/20 h-1.5 w-16 overflow-hidden rounded-full border shadow-inner">
+                    <div
+                      className={`h-full rounded-full transition-all duration-300 ${getQuotaBarColorClass(info.percentage)}`}
+                      style={{ width: `${clampQuotaPercentage(info.percentage)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const emptyQuotaState = (
+    <div className="text-muted-foreground flex flex-col items-center justify-center py-4">
+      <Box className="mb-2 h-8 w-8 opacity-20" />
+      <span className="text-xs">{t('cloud.card.noQuota')}</span>
+    </div>
+  );
+
+  const providerStats = providerGroupingsEnabled
+    ? getAccountStats({
+        ...account,
+        quota: account.quota ? { ...account.quota, models: providerModels } : undefined,
+      })
+    : null;
+  const overallQuotaBar =
+    providerStats && providerStats.visibleModels > 0 ? (
+      <div className="bg-muted/40 flex items-center justify-between rounded-lg px-3 py-1.5 text-xs">
+        <span className="font-medium">{t('settings.providerGroupings.overall')}</span>
+        <div className="flex items-center gap-2">
+          <span
+            className={`font-mono font-bold ${getQuotaTextColorClass(providerStats.overallPercentage)}`}
+          >
+            {formatQuotaLabel(providerStats.overallPercentage)}
+          </span>
+          <div className="bg-muted h-1.5 w-16 overflow-hidden rounded-full">
+            <div
+              className={`h-full rounded-full transition-all duration-300 ${getQuotaBarColorClass(providerStats.overallPercentage)}`}
+              style={{
+                width: `${clampQuotaPercentage(providerStats.overallPercentage)}%`,
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    ) : null;
+
+  const providerGroupedQuotaSection =
+    providerStats && providerStats.visibleModels > 0 ? (
+      <>
+        {overallQuotaBar}
+
+        <div className="mt-3 space-y-2">
+          {providerStats.providers.map((group) => (
+            <ProviderGroup
+              key={group.providerKey}
+              stats={group}
+              isCollapsed={isProviderCollapsed(account.id, group.providerKey)}
+              onToggleCollapse={() => toggleProviderCollapse(account.id, group.providerKey)}
+              getQuotaTextColorClass={getQuotaTextColorClass}
+              getQuotaBarColorClass={getQuotaBarColorClass}
+              formatQuotaLabel={formatQuotaLabel}
+              formatResetTimeLabel={formatResetTimeLabelText}
+              formatResetTimeTitle={formatResetTimeTitleText}
+              leftLabel={t('cloud.card.left')}
+            />
+          ))}
+        </div>
+      </>
+    ) : (
+      emptyQuotaState
+    );
+
+  const aiCredits = account.quota?.ai_credits;
+  const shouldShowAiCredits =
+    !!aiCredits && Number.isFinite(aiCredits.credits) && aiCredits.credits >= 0;
+
+  const validationBlockedStatusLabel = getCloudAccountBlockedStatusLabel(account, t);
+
+  return (
+    <Card
+      role="article"
+      aria-label={account.email}
+      className={`group bg-card hover:border-primary/30 border-border relative flex h-full flex-col overflow-hidden rounded-lg border shadow-none ${isSelected ? 'ring-primary border-primary/50 ring-2' : ''}`}
+    >
+      <CardHeader className="relative flex flex-row items-center gap-3 space-y-0 border-b p-4">
+        {onToggleSelection && (
+          <div className="flex shrink-0 items-center">
+            <Checkbox
+              checked={isSelected}
+              aria-label={account.email}
+              onCheckedChange={(checked) => onToggleSelection(account.id, checked as boolean)}
+              className="h-5 w-5 border-2"
+            />
+          </div>
+        )}
+
+        {account.avatar_url ? (
+          <img
+            src={account.avatar_url}
+            alt={account.name || ''}
+            className="bg-muted h-10 w-10 shrink-0 rounded-full border"
+          />
+        ) : (
+          <div className="bg-muted text-muted-foreground flex h-10 w-10 shrink-0 items-center justify-center rounded-full border font-bold">
+            {account.name?.[0]?.toUpperCase() || 'A'}
+          </div>
+        )}
+        <div className="min-w-0 flex-1">
+          <CardTitle className="truncate text-base font-semibold">
+            {account.name || t('cloud.card.unknown')}
+          </CardTitle>
+          <CardDescription className="text-muted-foreground truncate text-xs">
+            {account.email}
+          </CardDescription>
+
+          <CloudAccountClientStatus account={account} />
+
+          {shouldShowAiCredits && aiCredits && (
+            <div className="text-muted-foreground mt-1 flex items-center gap-1 text-[10px] font-medium">
+              <span>
+                {t('cloud.card.aiCreditsValue', {
+                  amount: formatAiCreditsAmount(aiCredits.credits),
+                })}
+              </span>
+              {aiCredits.expiryDate && (
+                <span className="text-muted-foreground opacity-70">
+                  ·{' '}
+                  {t('cloud.card.creditsExpiry', {
+                    date: formatCreditsExpiry(aiCredits.expiryDate),
+                  })}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {allModelEntries.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="hover:bg-muted h-8 w-8 cursor-pointer rounded-full"
+              >
+                {(() => {
+                  const hiddenCount = allModelEntries.filter(
+                    ([modelName]) => config?.model_visibility?.[modelName] === false,
+                  ).length;
+                  return hiddenCount > 0 ? (
+                    <EyeOff className="text-muted-foreground h-4 w-4" />
+                  ) : (
+                    <Eye className="h-4 w-4" />
+                  );
+                })()}
+                <span className="sr-only">{t('cloud.card.modelVisibility')}</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="w-64" align="end">
+              <DropdownMenuLabel>{t('cloud.card.modelVisibility')}</DropdownMenuLabel>
+              <div className="max-h-64 overflow-auto px-2 py-1">
+                {allModelEntries.map(([modelName]) => {
+                  const isVisible = config?.model_visibility?.[modelName] !== false;
+                  return (
+                    <DropdownMenuItem
+                      key={modelName}
+                      onSelect={(e) => e.preventDefault()}
+                      className="flex cursor-pointer items-center gap-2"
+                    >
+                      <Checkbox
+                        checked={isVisible}
+                        onCheckedChange={(checked) => {
+                          if (config) {
+                            const newVisibility = { ...config.model_visibility };
+                            newVisibility[modelName] = checked as boolean;
+                            saveConfig({ ...config, model_visibility: newVisibility });
+                          }
+                        }}
+                      />
+                      <span className="truncate text-xs" title={modelName}>
+                        {formatModelDisplayName(modelName)}
+                      </span>
+                    </DropdownMenuItem>
+                  );
+                })}
+              </div>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </CardHeader>
+
+      <CardContent className="flex-1 pb-4">
+        <div className="mb-3.5 flex items-center justify-between">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge
+              variant={
+                account.status === 'rate_limited' || account.status === 'expired'
+                  ? 'destructive'
+                  : 'outline'
+              }
+              className="px-2 py-0.5 text-[10px] font-bold tracking-wide"
+            >
+              {account.provider.toUpperCase()}
+            </Badge>
+            <AccountTierBadge account={account} unknownLabel={t('cloud.tierFilter.unknown')} />
+            {recommendationContext ? (
+              <ManualRecommendationBadge context={recommendationContext} />
+            ) : null}
+
+            {validationBlockedStatusLabel && (
+              <span className="text-destructive bg-destructive/10 border-destructive/20 rounded border px-1.5 py-0.5 text-[11px] font-semibold">
+                {validationBlockedStatusLabel}
+              </span>
+            )}
+            {account.health?.validation?.has_verification_link && (
+              <Button
+                variant="destructive"
+                size="sm"
+                className="h-6 gap-1 px-2 text-[10px]"
+                disabled={validationLink.isPending}
+                onClick={() => validationLink.open(account.id)}
+              >
+                <ExternalLink className="h-3 w-3" />
+                {t('cloud.card.completeValidation')}
+              </Button>
+            )}
+          </div>
+
+          <div
+            onMouseEnter={() => setMenuOpen(true)}
+            onMouseLeave={() => setMenuOpen(false)}
+            className="relative shrink-0"
+          >
+            <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 cursor-pointer gap-1.5 px-2.5 text-[11px] font-semibold"
+                >
+                  {isSwitching ? (
+                    <RefreshCw className="h-3 w-3 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Power className="h-3 w-3" aria-hidden="true" />
+                  )}
+                  {t('cloud.card.use')}
+                  <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                className="animate-in fade-in zoom-in-95 w-56 duration-100"
+                onMouseEnter={() => setMenuOpen(true)}
+              >
+                <DropdownMenuLabel className="text-muted-foreground px-2 py-1.5 text-[10px] tracking-wider uppercase">
+                  {t('cloud.card.switchTarget', 'Switch Environment')}
+                </DropdownMenuLabel>
+                <DropdownMenuItem
+                  onClick={() => onSwitch(account.id)}
+                  disabled={isSwitching || account.is_active_classic}
+                  className="flex cursor-pointer items-center justify-between py-2 text-xs"
+                >
+                  <span className="flex items-center gap-2">
+                    <Power className="text-primary h-3.5 w-3.5" />
+                    <span>{t('account.switchToAntigravity', 'Switch to Antigravity')}</span>
+                  </span>
+                  {account.is_active_classic && (
+                    <Badge className="h-4 border-none bg-green-500/20 px-1 text-[9px] font-semibold text-green-600 hover:bg-green-500/20">
+                      Active
+                    </Badge>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => onSwitch(account.id, 'ide')}
+                  disabled={isSwitching || account.is_active_ide}
+                  className="flex cursor-pointer items-center justify-between py-2 text-xs"
+                >
+                  <span className="flex items-center gap-2">
+                    <Repeat2 className="text-primary h-3.5 w-3.5" />
+                    <span>{t('account.switchToIde', 'Switch to Antigravity IDE')}</span>
+                  </span>
+                  {account.is_active_ide && (
+                    <Badge className="bg-success-soft text-success hover:bg-success-soft h-4 border-none px-1 text-[9px] font-semibold">
+                      Active
+                    </Badge>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => onSwitch(account.id, 'agy')}
+                  disabled={isSwitching || account.is_active_agy}
+                  className="flex cursor-pointer items-center justify-between py-2 text-xs"
+                >
+                  <span className="flex items-center gap-2">
+                    <Terminal className="text-primary h-3.5 w-3.5" />
+                    <span>{t('account.switchToAgy', 'Switch to Antigravity CLI')}</span>
+                  </span>
+                  {account.is_active_agy && (
+                    <Badge className="h-4 border-none bg-emerald-500/20 px-1 text-[9px] font-semibold text-emerald-600 hover:bg-emerald-500/20">
+                      Active
+                    </Badge>
+                  )}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <AccountQuotaWindowSections
+            quotaWindow={quotaWindow}
+            weeklyItems={
+              isMinimalMode
+                ? weeklyQuotaItems.filter(
+                    (item) => isGeminiWeeklyQuotaItem(item) || isClaudeOrGptWeeklyQuotaItem(item),
+                  )
+                : weeklyQuotaItems
+            }
+            fiveHourHidden={isMinimalMode ? false : fiveHourHidden}
+            weeklyHidden={isMinimalMode ? false : weeklyHidden}
+            hasQuotaSummary={account.quota?.quota_groups !== undefined}
+            fiveHourContent={
+              isMinimalMode ? (
+                <>
+                  {overallQuotaBar}
+                  <DetailedQuotaDisplay
+                    groups={detailedGroups.filter(
+                      (group) => isGeminiQuotaGroup(group) || isClaudeOrGptQuotaGroup(group),
+                    )}
+                  />
+                  {!overallQuotaBar &&
+                  detailedGroups.filter(
+                    (group) => isGeminiQuotaGroup(group) || isClaudeOrGptQuotaGroup(group),
+                  ).length === 0
+                    ? emptyQuotaState
+                    : null}
+                </>
+              ) : (
+                <>
+                  {providerGroupingsEnabled ? (
+                    <>
+                      {providerGroupedQuotaSection}
+                      {!providerGroupedQuotaSection && !hasDetailedQuota ? emptyQuotaState : null}
+                    </>
+                  ) : hasVisibleQuotaModels ? (
+                    <div className="space-y-3">
+                      {renderQuotaModelGroup(t('cloud.card.groupGoogleGemini'), geminiModels)}
+                      <div className="pt-1" />
+                      {renderQuotaModelGroup(t('cloud.card.groupAnthropicClaude'), claudeModels)}
+                    </div>
+                  ) : hasDetailedQuota ? null : (
+                    emptyQuotaState
+                  )}
+                  <DetailedQuotaDisplay groups={detailedGroups} />
+                </>
+              )
+            }
+          />
+        </div>
+      </CardContent>
+
+      <CardFooter className="bg-muted/10 mt-auto flex h-11 shrink-0 items-center justify-between gap-3 overflow-hidden border-t p-2 px-4">
+        <div className="flex min-w-0 flex-1 items-center justify-between gap-2">
+          <span className="text-muted-foreground truncate text-[11px]">
+            {t('cloud.card.used')}{' '}
+            {formatAccountLastUsed(account.last_used, i18n?.language ?? 'en')}
+          </span>
+          {account.proxy_configured && (
+            <span className="text-primary bg-primary/10 border-primary/20 origin-right scale-90 rounded-full border px-1.5 py-0.5 text-[9px] font-semibold">
+              Proxy
+            </span>
+          )}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Action Icons group with Tooltips */}
+          <div className="flex shrink-0 items-center gap-1">
+            <TooltipProvider>
+              {/* Refresh Button */}
+              <Tooltip delayDuration={300}>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="hover:bg-accent border-border/50 h-7 w-7 cursor-pointer rounded-md"
+                    onClick={() => onRefresh(account.id)}
+                    aria-label={t('cloud.card.refresh')}
+                    disabled={isRefreshing}
+                  >
+                    <RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent className="text-xs">{t('cloud.card.refresh')}</TooltipContent>
+              </Tooltip>
+
+              {/* Profile Button */}
+              <Tooltip delayDuration={300}>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="hover:bg-accent border-border/50 h-7 w-7 cursor-pointer rounded-md"
+                    onClick={() => onManageIdentity(account.id)}
+                    aria-label={t('cloud.card.identityProfile')}
+                  >
+                    <Fingerprint className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent className="text-xs">
+                  {t('cloud.card.identityProfile')}
+                </TooltipContent>
+              </Tooltip>
+
+              {/* Delete Button */}
+              <Tooltip delayDuration={300}>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30 border-border/50 h-7 w-7 cursor-pointer rounded-md"
+                    onClick={() => onDelete(account.id)}
+                    aria-label={t('cloud.card.delete')}
+                    disabled={isDeleting}
+                  >
+                    <Trash className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent className="text-xs">{t('cloud.card.delete')}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
+
+          <CloudAccountProxyDialog accountId={account.id} configured={account.proxy_configured} />
+        </div>
+      </CardFooter>
+    </Card>
+  );
+}
+
+interface CompactCloudAccountCardProps {
+  account: CloudAccountView;
+  quotaWindow?: QuotaWindow;
+  quotaGroupVisibility?: QuotaGroupVisibility;
+  isMinimalMode?: boolean;
+  onRefresh: (id: string) => void;
+  onDelete: (id: string) => void;
+  onSwitch: (id: string, appTarget?: AntigravityAppTarget) => void;
+  onManageIdentity: (id: string) => void;
+  isRefreshing?: boolean;
+  isDeleting?: boolean;
+  isSwitching?: boolean;
+  switchingTarget?: AntigravityAppTarget;
+  recommendationContext?: ManualRecommendationContext;
+}
+
+export function CompactCloudAccountCard({
+  account,
+  quotaWindow = 'both',
+  quotaGroupVisibility = DEFAULT_QUOTA_GROUP_VISIBILITY,
+  isMinimalMode = false,
+  onRefresh,
+  onDelete,
+  onSwitch,
+  onManageIdentity,
+  isRefreshing,
+  isDeleting,
+  isSwitching,
+  recommendationContext,
+}: CompactCloudAccountCardProps) {
+  const { t } = useTranslation();
+  const validationLink = useOpenAccountValidationLink();
+  const { config } = useAppConfig();
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const {
+    models: mergedModelQuotas,
+    groups: detailedGroups,
+    weeklyItems: weeklyQuotaItems,
+    fiveHourHidden,
+    weeklyHidden,
+  } = getVisibleAccountQuota(account.quota, config?.model_visibility ?? {}, quotaGroupVisibility);
+
+  const modelQuotaItems = Object.entries(mergedModelQuotas)
+    .filter(
+      ([modelName]) =>
+        !isMinimalMode ||
+        (modelName.includes('gemini') && !GEMINI_LEGACY_MODEL_PATTERN.test(modelName)) ||
+        /claude|gpt/i.test(modelName),
+    )
+    .sort((a, b) => b[1].percentage - a[1].percentage)
+    .map(([modelName, info]) => ({
+      id: modelName,
+      label: formatModelDisplayName(modelName),
+      percentage: info.percentage,
+      resetTime: info.resetTime,
+    }));
+
+  const hasClaudeModel = modelQuotaItems.some((item) => /claude/i.test(item.id));
+  const hasGeminiModel = modelQuotaItems.some((item) => item.id.includes('gemini'));
+
+  const nonWeeklyGroupItems: CompactModelQuotaItem[] = detailedGroups
+    .filter(
+      (group) => !isMinimalMode || isGeminiQuotaGroup(group) || isClaudeOrGptQuotaGroup(group),
+    )
+    .flatMap((group) => {
+      const isClaudeGroup = isClaudeOrGptQuotaGroup(group);
+      const isGeminiGroup = isGeminiQuotaGroup(group);
+      if (isClaudeGroup && hasClaudeModel) {
+        return [];
+      }
+      if (isGeminiGroup && hasGeminiModel) {
+        return [];
+      }
+      const nonWeeklyBuckets = group.buckets.filter((bucket) => !isWeeklyQuotaBucket(bucket));
+      return nonWeeklyBuckets.map((bucket) => {
+        const groupName = group.display_name.replace(/\s+models?$/i, '').trim();
+        const label =
+          nonWeeklyBuckets.length > 1 && bucket.display_name
+            ? `${groupName} · ${bucket.display_name}`
+            : groupName || bucket.display_name || t('cloud.card.quotaGroupUnknown');
+        return {
+          id: `${group.display_name}:${bucket.bucket_id}:${bucket.window}`,
+          label,
+          percentage: Math.round(bucket.remaining_fraction * 100),
+          resetTime: bucket.reset_time,
+        };
+      });
+    })
+    .sort((a, b) => b.percentage - a.percentage);
+
+  const compactQuotaItems = [...modelQuotaItems, ...nonWeeklyGroupItems];
+
+  const aiCredits = account.quota?.ai_credits;
+  const shouldShowAiCredits =
+    !!aiCredits && Number.isFinite(aiCredits.credits) && aiCredits.credits >= 0;
+
+  const validationBlockedStatusLabel = getCloudAccountBlockedStatusLabel(account, t);
+
+  return (
+    <div
+      role="article"
+      aria-label={account.email}
+      className="group bg-card hover:border-primary/40 flex items-center gap-3 rounded-lg border px-3 py-2 transition-all duration-200"
+    >
+      {account.avatar_url ? (
+        <img
+          src={account.avatar_url}
+          alt={account.name || ''}
+          className="bg-muted mt-1 h-7 w-7 shrink-0 self-start rounded-full border"
+        />
+      ) : (
+        <div className="bg-primary/10 text-primary mt-1 flex h-7 w-7 shrink-0 items-center justify-center self-start rounded-full border text-xs font-semibold">
+          {account.name?.[0]?.toUpperCase() || 'A'}
+        </div>
+      )}
+
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="min-w-0 truncate text-sm font-semibold">
+            {account.name || t('cloud.card.unknown')}
+          </span>
+          <Badge
+            variant={
+              account.status === 'rate_limited' || account.status === 'expired'
+                ? 'destructive'
+                : 'outline'
+            }
+            className="shrink-0 text-[10px]"
+          >
+            {account.provider.toUpperCase()}
+          </Badge>
+          <AccountTierBadge
+            account={account}
+            unknownLabel={t('cloud.tierFilter.unknown')}
+            className="h-4 max-w-24 px-1 text-[9px]"
+          />
+          {recommendationContext ? (
+            <ManualRecommendationBadge context={recommendationContext} />
+          ) : null}
+        </div>
+
+        <div className="text-muted-foreground truncate text-xs" title={account.email}>
+          {account.email}
+        </div>
+        <CloudAccountClientStatus account={account} />
+
+        <div className="text-muted-foreground flex flex-wrap items-center gap-2 text-xs">
+          {validationBlockedStatusLabel && (
+            <span className="text-destructive shrink-0 font-medium">
+              {validationBlockedStatusLabel}
+            </span>
+          )}
+          {account.health?.validation?.has_verification_link && (
+            <button
+              type="button"
+              className="text-destructive inline-flex shrink-0 items-center gap-1 text-xs font-semibold"
+              disabled={validationLink.isPending}
+              onClick={() => validationLink.open(account.id)}
+            >
+              <ExternalLink className="h-3 w-3" />
+              {t('cloud.card.completeValidation')}
+            </button>
+          )}
+
+          {shouldShowAiCredits && aiCredits && (
+            <span className="text-muted-foreground shrink-0">
+              {t('cloud.card.aiCreditsValue', {
+                amount: formatAiCreditsAmount(aiCredits.credits),
+              })}
+              {aiCredits.expiryDate && (
+                <span className="text-muted-foreground">
+                  {' '}
+                  ·{' '}
+                  {t('cloud.card.creditsExpiry', {
+                    date: formatCreditsExpiry(aiCredits.expiryDate),
+                  })}
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+
+        <AccountQuotaWindowSections
+          quotaWindow={quotaWindow}
+          weeklyItems={
+            isMinimalMode
+              ? weeklyQuotaItems.filter(
+                  (item) => isGeminiWeeklyQuotaItem(item) || isClaudeOrGptWeeklyQuotaItem(item),
+                )
+              : weeklyQuotaItems
+          }
+          fiveHourHidden={isMinimalMode ? false : fiveHourHidden}
+          weeklyHidden={isMinimalMode ? false : weeklyHidden}
+          hasQuotaSummary={account.quota?.quota_groups !== undefined}
+          variant="compact"
+          fiveHourContent={<CompactModelQuotaDisplay items={compactQuotaItems} />}
+        />
+      </div>
+
+      <div className="flex shrink-0 items-center gap-1">
+        <div
+          onMouseEnter={() => setMenuOpen(true)}
+          onMouseLeave={() => setMenuOpen(false)}
+          className="relative"
+        >
+          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 cursor-pointer gap-1.5 px-2.5 text-[11px] font-semibold"
+              >
+                {isSwitching ? (
+                  <RefreshCw className="h-3 w-3 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Power className="h-3 w-3" aria-hidden="true" />
+                )}
+                {t('cloud.card.use')}
+                <ChevronDown className="h-3 w-3" aria-hidden="true" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="end"
+              className="w-56"
+              onMouseEnter={() => setMenuOpen(true)}
+            >
+              <DropdownMenuLabel className="text-muted-foreground px-2 py-1.5 text-[10px] tracking-wider uppercase">
+                {t('cloud.card.switchTarget', 'Switch Environment')}
+              </DropdownMenuLabel>
+              <DropdownMenuItem
+                onClick={() => onSwitch(account.id)}
+                disabled={isSwitching || account.is_active_classic}
+                className="flex cursor-pointer items-center justify-between py-2 text-xs"
+              >
+                <span className="flex items-center gap-2">
+                  <Power className="text-primary h-3.5 w-3.5" />
+                  <span>{t('account.switchToAntigravity', 'Switch to Antigravity')}</span>
+                </span>
+                {account.is_active_classic && (
+                  <Badge className="h-4 border-none bg-green-500/20 px-1 text-[9px] font-semibold text-green-600 hover:bg-green-500/20">
+                    Active
+                  </Badge>
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => onSwitch(account.id, 'ide')}
+                disabled={isSwitching || account.is_active_ide}
+                className="flex cursor-pointer items-center justify-between py-2 text-xs"
+              >
+                <span className="flex items-center gap-2">
+                  <Repeat2 className="text-primary h-3.5 w-3.5" />
+                  <span>{t('account.switchToIde', 'Switch to Antigravity IDE')}</span>
+                </span>
+                {account.is_active_ide && (
+                  <Badge className="bg-success-soft text-success hover:bg-success-soft h-4 border-none px-1 text-[9px] font-semibold">
+                    Active
+                  </Badge>
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => onSwitch(account.id, 'agy')}
+                disabled={isSwitching || account.is_active_agy}
+                className="flex cursor-pointer items-center justify-between py-2 text-xs"
+              >
+                <span className="flex items-center gap-2">
+                  <Terminal className="text-primary h-3.5 w-3.5" />
+                  <span>{t('account.switchToAgy', 'Switch to Antigravity CLI')}</span>
+                </span>
+                {account.is_active_agy && (
+                  <Badge className="h-4 border-none bg-emerald-500/20 px-1 text-[9px] font-semibold text-emerald-600 hover:bg-emerald-500/20">
+                    Active
+                  </Badge>
+                )}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" className="h-7 w-7 cursor-pointer rounded-full">
+              <MoreVertical className="h-3.5 w-3.5" />
+              <span className="sr-only">Menu</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuLabel>{t('cloud.card.actions')}</DropdownMenuLabel>
+            <DropdownMenuItem onClick={() => onRefresh(account.id)} disabled={isRefreshing}>
+              <RefreshCw className="mr-2 h-4 w-4" />
+              {t('cloud.card.refresh')}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => onManageIdentity(account.id)}>
+              <Fingerprint className="mr-2 h-4 w-4" />
+              {t('cloud.card.identityProfile')}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onClick={() => onDelete(account.id)}
+              className="text-destructive focus:text-destructive"
+              disabled={isDeleting}
+            >
+              <Trash className="mr-2 h-4 w-4" />
+              {t('cloud.card.delete')}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </div>
+  );
+}

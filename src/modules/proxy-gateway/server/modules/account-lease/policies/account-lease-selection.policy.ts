@@ -1,0 +1,543 @@
+import type { ConcurrencyPoolService } from '../concurrency-pool.service';
+
+export type AccountLeaseSelectionMode = 'cache-first' | 'balance' | 'performance-first';
+export type AccountLeaseSelectionEntry<T> = [string, T];
+
+export interface AccountLeaseRateLimitReader {
+  isRateLimited(accountId: string, model?: string): boolean;
+  getRemainingWaitSeconds(accountId: string, model?: string): number;
+}
+
+export interface AccountLeaseSelectionConfig {
+  quotaAwareSchedulingEnabled: boolean;
+  parityEnabled: boolean;
+  parityShadowEnabled: boolean;
+  schedulingMode: AccountLeaseSelectionMode;
+  accountSelectionStrategy: 'balanced' | 'account-first';
+  preferredAccountId?: string;
+  maxWaitMs: number;
+  noGoMismatchRateThreshold: number;
+  noGoErrorRateThreshold: number;
+}
+
+interface AccountLeaseSelectionLogger {
+  warn(message: string): void;
+  error(message: string): void;
+}
+
+export interface AccountLeaseSelectionRequest<T> {
+  allTokens: Array<AccountLeaseSelectionEntry<T>>;
+  getModelQuota?: (accountId: string, token: T, model: string) => number | undefined;
+  sessionKey?: string;
+  model?: string;
+  now: number;
+  accountCooldowns: Map<string, number>;
+  rateLimitTracker: AccountLeaseRateLimitReader;
+  config: AccountLeaseSelectionConfig;
+  logger: AccountLeaseSelectionLogger;
+  concurrencyPool?: ConcurrencyPoolService;
+  maxConcurrency?: number;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+export class AccountLeaseSelectionPolicy {
+  private currentIndex = 0;
+  private accountFirstBindings = new Map<string, string>();
+  private lastAccountSelectionStrategy?: AccountLeaseSelectionConfig['accountSelectionStrategy'];
+  private sessionBindings: Map<string, { accountId: string; expiresAt: number }> = new Map();
+  private parityRequestCount = 0;
+  private parityErrorCount = 0;
+  private noGoBlocked = false;
+  private shadowComparisonCount = 0;
+  private shadowMismatchCount = 0;
+
+  getShadowComparisonCount(): number {
+    return this.shadowComparisonCount;
+  }
+
+  isNoGoBlocked(): boolean {
+    return this.noGoBlocked;
+  }
+
+  clearSessions(): void {
+    this.sessionBindings.clear();
+  }
+
+  clearAccountSessions(accountId: string): void {
+    for (const [model, id] of this.accountFirstBindings) {
+      if (id === accountId) {
+        this.accountFirstBindings.delete(model);
+      }
+    }
+    for (const [sessionKey, binding] of this.sessionBindings) {
+      if (binding.accountId === accountId) {
+        this.sessionBindings.delete(sessionKey);
+      }
+    }
+  }
+
+  resetSelectionState(): void {
+    this.currentIndex = 0;
+    this.accountFirstBindings.clear();
+  }
+
+  recordParityError(
+    config: AccountLeaseSelectionConfig,
+    logger: AccountLeaseSelectionLogger,
+  ): void {
+    if (!this.isParitySchedulingEnabled(config)) {
+      return;
+    }
+
+    this.parityErrorCount++;
+    const errorRate = this.parityErrorCount / Math.max(1, this.parityRequestCount);
+    if (errorRate > config.noGoErrorRateThreshold) {
+      this.noGoBlocked = true;
+      logger.error(
+        `Parity no-go triggered by error threshold: rate=${errorRate.toFixed(4)}, requests=${this.parityRequestCount}, errors=${this.parityErrorCount}`,
+      );
+    }
+  }
+
+  isParitySchedulingEnabled(config: AccountLeaseSelectionConfig): boolean {
+    if (this.noGoBlocked) {
+      return false;
+    }
+    return config.parityEnabled;
+  }
+
+  shouldExecuteShadowComparison(config: AccountLeaseSelectionConfig): boolean {
+    return config.parityShadowEnabled && !this.isParitySchedulingEnabled(config);
+  }
+
+  async selectCandidate<T>(
+    request: AccountLeaseSelectionRequest<T>,
+  ): Promise<AccountLeaseSelectionEntry<T> | null> {
+    this.clearExpiredSessionBindings(request.now);
+
+    let activeRequest = request;
+    if (request.concurrencyPool) {
+      const pool = request.concurrencyPool;
+      const defaultMax = request.maxConcurrency ?? 4;
+      const filtered: Array<AccountLeaseSelectionEntry<T>> = [];
+
+      for (const entry of request.allTokens) {
+        const [accountId, tokenData] = entry;
+        const isCooldown = await pool.isCoolingDown(accountId, request.model);
+        if (isCooldown) {
+          continue;
+        }
+        const maxConc =
+          (tokenData as unknown as Record<string, unknown> | undefined)?.maxConcurrency ??
+          (tokenData as unknown as Record<string, unknown> | undefined)?.max_concurrency ??
+          defaultMax;
+        const load = await pool.getConcurrency(accountId);
+        if (typeof maxConc === 'number' && load >= maxConc) {
+          continue;
+        }
+        filtered.push(entry);
+      }
+
+      if (filtered.length === 0) {
+        return null;
+      }
+
+      if (request.config.accountSelectionStrategy === 'account-first') {
+        activeRequest = {
+          ...request,
+          allTokens: filtered,
+        };
+      } else if (filtered.length > 1) {
+        const stickyBinding = this.getValidSessionBinding(request.sessionKey, request.now);
+        const stickyCandidate = stickyBinding
+          ? filtered.find(([id]) => id === stickyBinding.accountId)
+          : undefined;
+
+        if (stickyCandidate) {
+          activeRequest = {
+            ...request,
+            allTokens: filtered,
+          };
+        } else {
+          const scored = await Promise.all(
+            filtered.map(async (entry) => ({
+              entry,
+              load: await pool.getConcurrency(entry[0]),
+            })),
+          );
+          scored.sort((a, b) => a.load - b.load);
+          const minLoad = scored[0].load;
+          const leastBusy = scored.filter((s) => s.load === minLoad).map((s) => s.entry);
+          activeRequest = {
+            ...request,
+            allTokens: leastBusy,
+          };
+        }
+      } else {
+        activeRequest = {
+          ...request,
+          allTokens: filtered,
+        };
+      }
+    }
+
+    if (this.lastAccountSelectionStrategy !== activeRequest.config.accountSelectionStrategy) {
+      this.accountFirstBindings.clear();
+      this.lastAccountSelectionStrategy = activeRequest.config.accountSelectionStrategy;
+    }
+    // This user-selected strategy is independent of the experimental parity scheduler.
+    if (activeRequest.config.accountSelectionStrategy === 'account-first') {
+      return this.selectAccountFirstCandidate(activeRequest);
+    }
+
+    if (this.shouldExecuteShadowComparison(activeRequest.config)) {
+      this.executeShadowComparison(activeRequest);
+    }
+
+    let selectedTokenEntry = this.isParitySchedulingEnabled(activeRequest.config)
+      ? await this.selectParityTokenCandidate(activeRequest)
+      : this.selectLegacyTokenCandidate(activeRequest);
+
+    if (!selectedTokenEntry) {
+      const minWaitSeconds = activeRequest.allTokens
+        .map(([accountId]) =>
+          activeRequest.rateLimitTracker.getRemainingWaitSeconds(accountId, activeRequest.model),
+        )
+        .filter((waitSeconds) => waitSeconds > 0)
+        .reduce<number | undefined>(
+          (minimum, waitSeconds) =>
+            minimum === undefined ? waitSeconds : Math.min(minimum, waitSeconds),
+          undefined,
+        );
+
+      if (minWaitSeconds !== undefined && minWaitSeconds <= 2) {
+        await delay(minWaitSeconds * 1000);
+        const retryRequest = {
+          ...activeRequest,
+          now: Date.now(),
+        };
+        selectedTokenEntry = this.isParitySchedulingEnabled(activeRequest.config)
+          ? await this.selectParityTokenCandidate(retryRequest)
+          : this.selectLegacyTokenCandidate(retryRequest);
+      }
+    }
+
+    if (selectedTokenEntry && this.isParitySchedulingEnabled(activeRequest.config)) {
+      this.parityRequestCount++;
+    }
+
+    return selectedTokenEntry;
+  }
+
+  bindSession(sessionKey: string | undefined, accountId: string, expiresAt: number): void {
+    if (!sessionKey) {
+      return;
+    }
+    this.sessionBindings.set(sessionKey, {
+      accountId,
+      expiresAt,
+    });
+  }
+
+  private selectAccountFirstCandidate<T>(
+    request: AccountLeaseSelectionRequest<T>,
+  ): AccountLeaseSelectionEntry<T> | null {
+    const candidates = this.collectEligibleTokens(
+      request.allTokens,
+      request.model,
+      request.now,
+      request.accountCooldowns,
+      request.rateLimitTracker,
+    ).filter(([id, token]) => {
+      const quota = request.model ? request.getModelQuota?.(id, token, request.model) : undefined;
+      return quota === undefined || !Number.isFinite(quota) || quota > 0;
+    });
+    const model = request.model?.trim().toLowerCase() ?? '';
+    const preferred = candidates.find(([id]) => id === request.config.preferredAccountId);
+    const session = this.findStickySessionToken(candidates, request.sessionKey, request.now);
+    const retained = candidates.find(([id]) => id === this.accountFirstBindings.get(model));
+    const selected = preferred ?? session ?? retained ?? candidates[0] ?? null;
+    if (selected) {
+      // Bound state for callers that provide many distinct model identifiers.
+      if (!this.accountFirstBindings.has(model) && this.accountFirstBindings.size >= 256) {
+        const oldest = this.accountFirstBindings.keys().next().value;
+        if (oldest !== undefined) {
+          this.accountFirstBindings.delete(oldest);
+        }
+      }
+      this.accountFirstBindings.set(model, selected[0]);
+    }
+    return selected;
+  }
+
+  private collectEligibleTokens<T>(
+    allTokens: Array<AccountLeaseSelectionEntry<T>>,
+    model: string | undefined,
+    now: number,
+    accountCooldowns: Map<string, number>,
+    rateLimitTracker: AccountLeaseRateLimitReader,
+  ): Array<AccountLeaseSelectionEntry<T>> {
+    return allTokens.filter(([accountId]) => {
+      const cooldownUntil = accountCooldowns.get(accountId);
+      if (cooldownUntil && cooldownUntil > now) {
+        return false;
+      }
+      return !rateLimitTracker.isRateLimited(accountId, model);
+    });
+  }
+
+  private getValidSessionBinding(
+    sessionKey: string | undefined,
+    now: number,
+  ): { accountId: string; expiresAt: number } | null {
+    if (!sessionKey) {
+      return null;
+    }
+    const stickyBinding = this.sessionBindings.get(sessionKey);
+    if (!stickyBinding || stickyBinding.expiresAt <= now) {
+      return null;
+    }
+    return stickyBinding;
+  }
+
+  private findStickySessionToken<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+    sessionKey: string | undefined,
+    now: number,
+  ): AccountLeaseSelectionEntry<T> | null {
+    const stickyBinding = this.getValidSessionBinding(sessionKey, now);
+    if (!stickyBinding) {
+      return null;
+    }
+
+    return candidates.find(([accountId]) => accountId === stickyBinding.accountId) ?? null;
+  }
+
+  private pickRoundRobinEntry<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+  ): AccountLeaseSelectionEntry<T> | null {
+    if (candidates.length === 0) {
+      return null;
+    }
+    const picked = candidates[this.currentIndex % candidates.length];
+    this.currentIndex++;
+    return picked;
+  }
+
+  private weightedCandidates<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+    request: AccountLeaseSelectionRequest<T>,
+  ): Array<AccountLeaseSelectionEntry<T>> {
+    const model = request.model;
+    const getModelQuota = request.getModelQuota;
+    if (!request.config.quotaAwareSchedulingEnabled || !model || !getModelQuota) {
+      return candidates;
+    }
+    return candidates.flatMap((candidate) => {
+      const quota = getModelQuota(candidate[0], candidate[1], model);
+      const weight =
+        quota === undefined || !Number.isFinite(quota) ? 1 : quota >= 75 ? 3 : quota >= 25 ? 2 : 1;
+      return Array.from({ length: weight }, () => candidate);
+    });
+  }
+
+  private peekRoundRobinCandidateAccountId<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+  ): string | null {
+    if (candidates.length === 0) {
+      return null;
+    }
+    return candidates[this.currentIndex % candidates.length][0];
+  }
+
+  private selectLegacyTokenCandidate<T>(
+    request: AccountLeaseSelectionRequest<T>,
+  ): AccountLeaseSelectionEntry<T> | null {
+    const availableTokens = request.allTokens.filter(([accountId]) => {
+      const cooldownUntil = request.accountCooldowns.get(accountId);
+      if (cooldownUntil && cooldownUntil > request.now) {
+        return false;
+      }
+      return !request.rateLimitTracker.isRateLimited(accountId, request.model);
+    });
+
+    if (availableTokens.length === 0) {
+      return null;
+    }
+
+    const stickyToken = this.findStickySessionToken(
+      availableTokens,
+      request.sessionKey,
+      request.now,
+    );
+    if (stickyToken) {
+      return stickyToken;
+    }
+
+    return this.pickRoundRobinEntry(this.weightedCandidates(availableTokens, request));
+  }
+
+  private async selectParityTokenCandidate<T>(
+    request: AccountLeaseSelectionRequest<T>,
+  ): Promise<AccountLeaseSelectionEntry<T> | null> {
+    const availableTokens = this.collectEligibleTokens(
+      request.allTokens,
+      request.model,
+      request.now,
+      request.accountCooldowns,
+      request.rateLimitTracker,
+    );
+    if (availableTokens.length === 0) {
+      return null;
+    }
+
+    const preferredAccountId = request.config.preferredAccountId;
+    if (preferredAccountId) {
+      const preferred = availableTokens.find(([accountId]) => accountId === preferredAccountId);
+      if (preferred) {
+        return preferred;
+      }
+    }
+
+    const stickyToken = this.findStickySessionToken(
+      availableTokens,
+      request.sessionKey,
+      request.now,
+    );
+    if (stickyToken) {
+      return stickyToken;
+    }
+
+    const stickyBinding = this.getValidSessionBinding(request.sessionKey, request.now);
+    if (stickyBinding && request.config.schedulingMode === 'cache-first') {
+      const waitSec = request.rateLimitTracker.getRemainingWaitSeconds(
+        stickyBinding.accountId,
+        request.model,
+      );
+      const waitMs = waitSec * 1000;
+      if (waitMs > 0 && waitMs <= request.config.maxWaitMs) {
+        await delay(waitMs);
+        const refreshedAvailable = this.collectEligibleTokens(
+          request.allTokens,
+          request.model,
+          Date.now(),
+          request.accountCooldowns,
+          request.rateLimitTracker,
+        );
+        const stickyAfterWait =
+          refreshedAvailable.find(([accountId]) => accountId === stickyBinding.accountId) ?? null;
+        if (stickyAfterWait) {
+          return stickyAfterWait;
+        }
+        if (refreshedAvailable.length > 0) {
+          return this.pickRoundRobinEntry(this.weightedCandidates(refreshedAvailable, request));
+        }
+      }
+    }
+
+    return this.pickRoundRobinEntry(this.weightedCandidates(availableTokens, request));
+  }
+
+  private predictLegacyAccountCandidateId<T>(
+    request: AccountLeaseSelectionRequest<T>,
+  ): string | null {
+    const availableTokens = request.allTokens.filter(([accountId]) => {
+      const cooldownUntil = request.accountCooldowns.get(accountId);
+      if (cooldownUntil && cooldownUntil > request.now) {
+        return false;
+      }
+      return !request.rateLimitTracker.isRateLimited(accountId, request.model);
+    });
+    if (availableTokens.length === 0) {
+      return null;
+    }
+
+    const stickyToken = this.findStickySessionToken(
+      availableTokens,
+      request.sessionKey,
+      request.now,
+    );
+    if (stickyToken) {
+      return stickyToken[0];
+    }
+
+    return this.peekRoundRobinCandidateAccountId(this.weightedCandidates(availableTokens, request));
+  }
+
+  private predictParityAccountCandidateId<T>(
+    request: AccountLeaseSelectionRequest<T>,
+  ): string | null {
+    const availableTokens = this.collectEligibleTokens(
+      request.allTokens,
+      request.model,
+      request.now,
+      request.accountCooldowns,
+      request.rateLimitTracker,
+    );
+    if (availableTokens.length === 0) {
+      return null;
+    }
+
+    const preferredAccountId = request.config.preferredAccountId;
+    if (preferredAccountId) {
+      const preferred = availableTokens.find(([accountId]) => accountId === preferredAccountId);
+      if (preferred) {
+        return preferred[0];
+      }
+    }
+
+    const stickyToken = this.findStickySessionToken(
+      availableTokens,
+      request.sessionKey,
+      request.now,
+    );
+    if (stickyToken) {
+      return stickyToken[0];
+    }
+
+    return this.peekRoundRobinCandidateAccountId(this.weightedCandidates(availableTokens, request));
+  }
+
+  private executeShadowComparison<T>(request: AccountLeaseSelectionRequest<T>): void {
+    const legacyAccountId = this.predictLegacyAccountCandidateId(request);
+    const parityAccountId = this.predictParityAccountCandidateId(request);
+
+    this.updateShadowStats(legacyAccountId, parityAccountId, request);
+  }
+
+  private updateShadowStats<T>(
+    legacyId: string | null,
+    parityId: string | null,
+    request: AccountLeaseSelectionRequest<T>,
+  ): void {
+    this.shadowComparisonCount++;
+
+    if (legacyId !== parityId) {
+      this.shadowMismatchCount++;
+      request.logger.warn(
+        `Parity shadow mismatch detected: legacy=${legacyId ?? 'n/a'}, parity=${parityId ?? 'n/a'}`,
+      );
+    }
+
+    const mismatchRate = this.shadowMismatchCount / Math.max(1, this.shadowComparisonCount);
+    if (mismatchRate > request.config.noGoMismatchRateThreshold) {
+      this.noGoBlocked = true;
+      request.logger.error(
+        `Parity no-go triggered by mismatch threshold: rate=${mismatchRate.toFixed(4)}, comparisons=${this.shadowComparisonCount}`,
+      );
+    }
+  }
+
+  private clearExpiredSessionBindings(now: number): void {
+    for (const [sessionKey, binding] of this.sessionBindings.entries()) {
+      if (binding.expiresAt <= now) {
+        this.sessionBindings.delete(sessionKey);
+      }
+    }
+  }
+}

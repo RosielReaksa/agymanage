@@ -1,0 +1,207 @@
+import { app, Tray, Menu, nativeImage, BrowserWindow } from 'electron';
+import type { CloudAccountView } from '@/modules/cloud-account/services/cloud-account-view';
+import { logger } from '@/shared/logging/logger';
+import { getTrayTexts, type TrayTexts } from './i18n';
+import { getCloudAccountAdapter } from '@/modules/cloud-account/ipc/cloud-account-adapter';
+import { configureTrayIcon, resolveTrayIconPath } from './icon';
+
+type TrayAccount = Pick<CloudAccountView, 'email' | 'quota'>;
+let tray: Tray | null = null;
+let globalMainWindow: BrowserWindow | null = null;
+let lastAccount: TrayAccount | null = null;
+let lastLanguage: string = 'en';
+let onQuitRequested: (() => void | Promise<void>) | null = null;
+
+function getQuotaText(account: TrayAccount | null, texts: TrayTexts): string[] {
+  if (!account) return [`${texts.quota}: --`];
+  if (!account.quota || !account.quota.models) return [`${texts.quota}: ${texts.unknown_quota}`];
+
+  const lines: string[] = [];
+  const models = account.quota.models;
+
+  let gHigh = 0;
+  let gImage = 0;
+  let claude = 0;
+
+  for (const [key, val] of Object.entries(models)) {
+    const k = key.toLowerCase();
+    if (k.includes('high')) gHigh = val.percentage;
+    else if (k.includes('image')) gImage = val.percentage;
+    else if (k.includes('claude')) claude = val.percentage;
+  }
+
+  lines.push(`Gemini High: ${gHigh}%`);
+  lines.push(`Gemini Image: ${gImage}%`);
+  lines.push(`Claude 4.5: ${claude}%`);
+
+  return lines;
+}
+
+export function setTrayMainWindow(mainWindow: BrowserWindow | null): void {
+  globalMainWindow = mainWindow;
+}
+
+export function initTray(mainWindow: BrowserWindow, quitHandler?: () => void | Promise<void>) {
+  globalMainWindow = mainWindow;
+  onQuitRequested = quitHandler ?? null;
+
+  // PATCH 3: Destroy existing tray before creating new one (prevents zombie tray icons)
+  if (tray) {
+    try {
+      tray.destroy();
+    } catch (e) {
+      logger.error('Failed to destroy existing tray', e);
+    }
+    tray = null;
+    logger.info('Destroyed existing tray before creating new one');
+  }
+
+  const inDevelopment = process.env.NODE_ENV === 'development';
+  // In production, extraResource copies 'src/assets' folder to 'resources/assets'.
+  const iconPath = resolveTrayIconPath({
+    inDevelopment,
+    platform: process.platform,
+    cwd: process.cwd(),
+    resourcesPath: process.resourcesPath,
+  });
+
+  logger.info(
+    `Tray icon path: ${iconPath}, inDevelopment: ${inDevelopment}, resourcesPath: ${process.resourcesPath}`,
+  );
+
+  const icon = nativeImage.createFromPath(iconPath);
+
+  // Verify icon is valid before creating tray
+  if (icon.isEmpty()) {
+    logger.error(`Tray icon not found or invalid at path: ${iconPath}`);
+    return;
+  }
+
+  configureTrayIcon(icon, process.platform);
+  tray = new Tray(icon);
+  tray.setToolTip('Antigravity Manager');
+
+  tray.on('double-click', () => {
+    if (globalMainWindow) {
+      if (globalMainWindow.isVisible()) {
+        globalMainWindow.hide();
+      } else {
+        globalMainWindow.show();
+        globalMainWindow.focus();
+      }
+    }
+  });
+
+  updateTrayMenu(null);
+}
+
+export function updateTrayMenu(account: TrayAccount | null, language?: string) {
+  lastAccount = account;
+  if (language) {
+    lastLanguage = language;
+  }
+
+  if (!tray || !globalMainWindow) return;
+
+  const texts = getTrayTexts(lastLanguage);
+  const quotaLines = getQuotaText(account, texts);
+
+  const template: Electron.MenuItemConstructorOptions[] = [
+    {
+      label: account
+        ? `${texts.current}: ${account.email}`
+        : `${texts.current}: ${texts.no_account}`,
+      enabled: false,
+    },
+    ...quotaLines.map((line) => ({ label: line, enabled: false })),
+    { type: 'separator' },
+    {
+      label: texts.switch_next,
+      click: async () => {
+        try {
+          const accounts = await getCloudAccountAdapter().listViews();
+          if (accounts.length === 0) return;
+
+          const current = accounts.find((a) => a.is_active);
+          let nextIndex = 0;
+          if (current) {
+            const idx = accounts.findIndex((a) => a.id === current.id);
+            nextIndex = (idx + 1) % accounts.length;
+          }
+          const next = accounts[nextIndex];
+
+          await getCloudAccountAdapter().switchAccount(next.id);
+          logger.info(`Tray: Switched to account ${next.email}`);
+
+          updateTrayMenu(next, lastLanguage);
+
+          if (globalMainWindow) {
+            globalMainWindow.webContents.send('tray://account-switched', next.id);
+          }
+        } catch (e) {
+          logger.error('Tray: Switch account failed', e);
+        }
+      },
+    },
+    {
+      label: texts.refresh_current,
+      click: async () => {
+        try {
+          const accounts = await getCloudAccountAdapter().listViews();
+          const current = accounts.find((a) => a.is_active);
+          if (!current) return;
+
+          logger.info(`Tray: Refreshing quota for ${current.email}`);
+
+          const updated = await getCloudAccountAdapter().refreshQuota(current.id);
+          updateTrayMenu(updated, lastLanguage);
+
+          if (globalMainWindow) {
+            globalMainWindow.webContents.send('tray://refresh-current');
+          }
+        } catch (e) {
+          logger.error('Tray: Refresh quota failed', e);
+        }
+      },
+    },
+    { type: 'separator' },
+    {
+      label: texts.show_window,
+      click: () => {
+        globalMainWindow?.show();
+        globalMainWindow?.focus();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: texts.quit,
+      click: () => {
+        if (onQuitRequested) {
+          onQuitRequested();
+          return;
+        }
+        app.quit();
+      },
+    },
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  tray.setContextMenu(menu);
+}
+
+export function setTrayLanguage(lang: string) {
+  updateTrayMenu(lastAccount, lang);
+}
+
+export function destroyTray() {
+  if (tray) {
+    try {
+      tray.destroy();
+    } catch (e) {
+      logger.error('Failed to destroy tray', e);
+    }
+    tray = null;
+    onQuitRequested = null;
+    logger.info('Tray destroyed');
+  }
+}

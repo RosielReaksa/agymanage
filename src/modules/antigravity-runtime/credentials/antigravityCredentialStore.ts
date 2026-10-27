@@ -1,0 +1,358 @@
+import { Entry } from '@napi-rs/keyring';
+import { spawnSync } from 'child_process';
+import os from 'node:os';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { z } from 'zod';
+import { hasErrorCode, isErrorWithCode } from '@/shared/errors/error-guards';
+import { logger } from '@/shared/logging/logger';
+import type { CredentialStoreTokenInput } from '@/shared/auth/credentialStoreToken';
+import { writePrivateFileAtomically } from '@/shared/persistence/privateFile';
+import { readWindowsCredential, writeWindowsCredential } from './windowsCredentialStore';
+import type { AntigravityAppTarget } from '@/shared/platform/antigravityAppTarget';
+import { buildAntigravityCredentialPayload } from './antigravityCredentialPayload';
+import { readMacOSCredentialStore, writeMacOSCredentialStore } from './macosCredentialStore';
+
+export interface CredentialStoreToken {
+  accessToken?: string;
+  refreshToken: string;
+  idToken?: string;
+  projectId?: string;
+  expiryTimestamp?: number;
+}
+
+export type CredentialStoreReadErrorCode =
+  | 'permission-denied'
+  | 'locked'
+  | 'malformed'
+  | 'timed-out'
+  | 'unavailable';
+
+const CREDENTIAL_STORE_READ_ERROR_MESSAGES: Record<CredentialStoreReadErrorCode, string> = {
+  'permission-denied': 'Permission was denied while reading the Antigravity credential store.',
+  locked: 'The Antigravity credential store is locked.',
+  malformed: 'The Antigravity credential payload is malformed.',
+  'timed-out': 'Timed out while reading the Antigravity credential store.',
+  unavailable: 'The Antigravity credential store is unavailable.',
+};
+
+export class CredentialStoreReadError extends Error {
+  constructor(readonly code: CredentialStoreReadErrorCode) {
+    super(CREDENTIAL_STORE_READ_ERROR_MESSAGES[code]);
+    this.name = 'CredentialStoreReadError';
+  }
+}
+
+const CredentialTokenPayloadSchema = z
+  .object({
+    access_token: z.string().trim().min(1).optional(),
+    refresh_token: z.string().trim(),
+    id_token: z.string().trim().min(1).optional(),
+    project_id: z.string().trim().min(1).optional(),
+    expiry_timestamp: z.number().finite().optional(),
+    expiry: z.string().trim().min(1).optional(),
+  })
+  .passthrough()
+  .refine((token) => Boolean(token.refresh_token || token.access_token));
+
+const NestedCredentialPayloadSchema = z
+  .object({
+    token: CredentialTokenPayloadSchema,
+  })
+  .passthrough();
+
+function decodeCredentialStoreText(secret: Uint8Array): string {
+  let payload: string;
+  try {
+    payload = new TextDecoder('utf-8', { fatal: true }).decode(secret).trim();
+  } catch {
+    throw new CredentialStoreReadError('malformed');
+  }
+
+  if (!payload.startsWith('go-keyring-base64:')) {
+    return payload;
+  }
+
+  try {
+    const encodedPayload = payload.slice('go-keyring-base64:'.length);
+    return new TextDecoder('utf-8', { fatal: true })
+      .decode(Buffer.from(encodedPayload, 'base64'))
+      .trim();
+  } catch {
+    throw new CredentialStoreReadError('malformed');
+  }
+}
+
+function parseCredentialStorePayload(payload: string): CredentialStoreToken {
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(payload);
+  } catch {
+    throw new CredentialStoreReadError('malformed');
+  }
+
+  const nestedPayload = NestedCredentialPayloadSchema.safeParse(parsedJson);
+  let token: z.infer<typeof CredentialTokenPayloadSchema>;
+  if (nestedPayload.success) {
+    token = nestedPayload.data.token;
+  } else {
+    const topLevelPayload = CredentialTokenPayloadSchema.safeParse(parsedJson);
+    if (!topLevelPayload.success) {
+      throw new CredentialStoreReadError('malformed');
+    }
+    token = topLevelPayload.data;
+  }
+
+  let expiryTimestamp = token.expiry_timestamp;
+  if (expiryTimestamp === undefined && token.expiry) {
+    const parsedExpiry = Date.parse(token.expiry);
+    if (Number.isFinite(parsedExpiry)) {
+      expiryTimestamp = Math.floor(parsedExpiry / 1000);
+    }
+  }
+
+  return {
+    refreshToken: token.refresh_token,
+    ...(token.access_token ? { accessToken: token.access_token } : {}),
+    ...(token.id_token ? { idToken: token.id_token } : {}),
+    ...(token.project_id ? { projectId: token.project_id } : {}),
+    ...(expiryTimestamp !== undefined ? { expiryTimestamp } : {}),
+  };
+}
+
+/** Agy reads its session file; desktop clients read the system credential store. */
+export async function readClientAccountToken(
+  target?: AntigravityAppTarget | null,
+): Promise<CredentialStoreToken | null> {
+  if (process.platform === 'darwin') {
+    return readMacOSCredentialStore(true);
+  }
+  if (target !== 'agy') {
+    return readAntigravityCredentialStoreToken();
+  }
+  try {
+    const payload = await fs.readFile(
+      path.join(os.homedir(), '.gemini', 'antigravity-cli', 'antigravity-oauth-token'),
+      'utf8',
+    );
+    return parseCredentialStorePayload(payload);
+  } catch (error) {
+    if (hasErrorCode(error, 'ENOENT')) {
+      return null;
+    }
+    throw classifyCredentialStoreReadError(error);
+  }
+}
+
+function classifyCredentialStoreReadError(error: unknown): CredentialStoreReadError {
+  if (error instanceof CredentialStoreReadError) {
+    return error;
+  }
+  const message = error instanceof Error ? error.message.toLowerCase() : '';
+  const code = isErrorWithCode(error) ? error.code.toLowerCase() : '';
+
+  if (code === 'etimedout' || message.includes('timed out')) {
+    return new CredentialStoreReadError('timed-out');
+  }
+  if (
+    code === 'eacces' ||
+    code === 'eperm' ||
+    message.includes('permission denied') ||
+    message.includes('access denied')
+  ) {
+    return new CredentialStoreReadError('permission-denied');
+  }
+  if (message.includes('locked')) {
+    return new CredentialStoreReadError('locked');
+  }
+  return new CredentialStoreReadError('unavailable');
+}
+
+function createNativeCredentialEntry(): Entry {
+  // Secret Service interprets an explicit target as a collection name. The
+  // Windows credential target must not create a new Linux collection/prompt.
+  return process.platform === 'linux'
+    ? new Entry('gemini', 'antigravity')
+    : Entry.withTarget('gemini:antigravity', 'gemini', 'antigravity');
+}
+
+function readViaNativeKeyring(): Uint8Array | null {
+  const entry = createNativeCredentialEntry();
+  const secret = entry.getSecret();
+  return secret ? Uint8Array.from(secret) : null;
+}
+
+function readViaSecretTool(): Uint8Array | null {
+  const lookupResult = spawnSync(
+    'secret-tool',
+    ['lookup', 'service', 'gemini', 'username', 'antigravity'],
+    {
+      encoding: 'utf-8',
+      timeout: 10_000,
+    },
+  );
+  if (lookupResult.error) {
+    throw classifyCredentialStoreReadError(lookupResult.error);
+  }
+  if (lookupResult.status !== 0) {
+    const stderr = lookupResult.stderr?.toLowerCase() ?? '';
+    if (stderr.includes('permission denied') || stderr.includes('access denied')) {
+      throw new CredentialStoreReadError('permission-denied');
+    }
+    if (stderr.includes('locked')) {
+      throw new CredentialStoreReadError('locked');
+    }
+    return null;
+  }
+
+  const payload = lookupResult.stdout?.trim();
+  return payload ? Buffer.from(payload, 'utf-8') : null;
+}
+
+export async function readAntigravityCredentialStoreToken(): Promise<CredentialStoreToken | null> {
+  if (process.platform === 'darwin') {
+    return readMacOSCredentialStore(true);
+  }
+  if (process.platform === 'win32') {
+    try {
+      const payload = await readWindowsCredential('gemini:antigravity');
+      return payload === null ? null : parseCredentialStorePayload(payload);
+    } catch (error) {
+      throw classifyCredentialStoreReadError(error);
+    }
+  }
+  if (process.platform === 'linux') {
+    try {
+      const secret = readViaSecretTool();
+      if (secret) {
+        return parseCredentialStorePayload(decodeCredentialStoreText(secret));
+      }
+    } catch (error) {
+      const secretToolError = classifyCredentialStoreReadError(error);
+      if (secretToolError.code !== 'unavailable') {
+        throw secretToolError;
+      }
+    }
+
+    try {
+      const secret = readViaNativeKeyring();
+      return secret ? parseCredentialStorePayload(decodeCredentialStoreText(secret)) : null;
+    } catch (error) {
+      throw classifyCredentialStoreReadError(error);
+    }
+  }
+
+  try {
+    const secret = readViaNativeKeyring();
+    return secret ? parseCredentialStorePayload(decodeCredentialStoreText(secret)) : null;
+  } catch (error) {
+    throw classifyCredentialStoreReadError(error);
+  }
+}
+
+function isSecretToolAvailable(): boolean {
+  const probeResult = spawnSync('secret-tool', [], {
+    stdio: 'ignore',
+    timeout: 3000,
+  });
+  return !probeResult.error;
+}
+
+function writeViaNativeKeyring(payload: string): void {
+  const entry = createNativeCredentialEntry();
+  entry.setSecret(Buffer.from(payload, 'utf-8'));
+}
+
+type LinuxSecretServiceCollection = 'default' | 'login';
+
+function writeViaSecretTool(payload: string, collection: LinuxSecretServiceCollection): void {
+  const collectionArgs =
+    collection === 'login'
+      ? ['--collection=login', "--label=Password for 'antigravity' on 'gemini'"]
+      : ['--label=gemini'];
+  const storeResult = spawnSync(
+    'secret-tool',
+    ['store', ...collectionArgs, 'service', 'gemini', 'username', 'antigravity'],
+    { input: payload, encoding: 'utf-8', timeout: 10000 },
+  );
+  if (!storeResult.error && storeResult.status === 0) {
+    return;
+  }
+
+  throw new Error('Linux secret-tool failed to store credential');
+}
+
+function tryWriteLinuxSecretServiceCollection(
+  payload: string,
+  collection: LinuxSecretServiceCollection,
+): boolean {
+  try {
+    writeViaSecretTool(payload, collection);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface CredentialStoreWriteOptions {
+  syncClassicOAuthFile?: true;
+}
+
+export async function writeAntigravityCredentialStoreToken(
+  token: CredentialStoreTokenInput,
+  options: CredentialStoreWriteOptions = {},
+): Promise<void> {
+  if (process.platform === 'darwin') {
+    writeMacOSCredentialStore(token);
+    return;
+  }
+  const payload = buildAntigravityCredentialPayload(token);
+  logger.info('Writing Antigravity token to system credential store');
+
+  await writeToSystemCredentialStore(payload);
+
+  if (
+    process.platform === 'linux' &&
+    'syncClassicOAuthFile' in options &&
+    options.syncClassicOAuthFile
+  ) {
+    // Linux standalone builds can select file storage instead of Secret Service.
+    // This is the file opened by the official language server, not the CLI cache.
+    writePrivateFileAtomically(
+      path.join(os.homedir(), '.gemini', 'jetski-standalone-oauth-token'),
+      payload,
+    );
+  }
+}
+
+async function writeToSystemCredentialStore(payload: string): Promise<void> {
+  if (process.platform === 'win32') {
+    await writeWindowsCredential('gemini:antigravity', 'antigravity', payload);
+    return;
+  }
+  if (process.platform === 'linux' && isSecretToolAvailable()) {
+    const loginWritten = tryWriteLinuxSecretServiceCollection(payload, 'login');
+    const defaultWritten = tryWriteLinuxSecretServiceCollection(payload, 'default');
+
+    if (defaultWritten) {
+      if (loginWritten) {
+        logger.debug(
+          'Linux Secret Service credential synchronized to login and default collections',
+        );
+      } else {
+        logger.warn(
+          'Linux Secret Service login collection write failed; default collection remains current',
+        );
+      }
+      return;
+    }
+
+    logger.warn(
+      loginWritten
+        ? 'Linux Secret Service default collection write failed; falling back to native keyring'
+        : 'Linux Secret Service login and default collection writes failed; falling back to native keyring',
+    );
+  }
+
+  writeViaNativeKeyring(payload);
+}

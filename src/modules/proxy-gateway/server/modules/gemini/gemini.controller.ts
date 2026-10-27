@@ -1,0 +1,374 @@
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  HttpStatus,
+  Inject,
+  HttpException,
+  Param,
+  Post,
+  Req,
+  Res,
+  UseGuards,
+  Optional,
+} from '@nestjs/common';
+import { FastifyReply, FastifyRequest } from 'fastify';
+import { isEmpty, isNumber } from 'lodash-es';
+import { Observable } from 'rxjs';
+
+import { ProxyGuard } from '../../guards/proxy.guard';
+import { getConfiguredModelMapping } from '@/modules/config/model-aliases';
+import { FilesService } from '@/modules/proxy-gateway/server/modules/files/files.service';
+import {
+  expandFileReferences,
+  FileReferenceError,
+} from '@/modules/proxy-gateway/server/modules/files/file-reference-expander';
+import { BatchService } from '../batch/batch.service';
+import { respondGeminiBatchGenerateContent } from '../batch/gemini-batch-submit';
+import { GeminiService } from './gemini.service';
+import { InvalidCountTokensRequestError } from './gemini-count-tokens';
+import { GeminiRequest, GeminiResponse } from '../../common/interfaces/request-interfaces';
+import { getServerConfig } from '../../../../../server/server-config';
+import { getAllDynamicModels } from '../../../antigravity/ModelMapping';
+import { AccountLeaseService } from '../account-lease/account-lease.service';
+import { UpstreamRequestError } from '../../common/exceptions/upstream-request.exception';
+import {
+  applyProxyRetryAfterHeader,
+  createProxyRequestAbortScope,
+} from '../../common/base-proxy.controller';
+import { setProxyResponseTimingHeaders } from '../../common/proxy-response-timing';
+import { writeProxySseResponse } from '../../common/proxy-sse-response';
+
+type GeminiModelMetadata = {
+  name: string;
+  displayName: string;
+  description: string;
+  inputTokenLimit: number;
+  outputTokenLimit: number;
+  supportedGenerationMethods: string[];
+  temperature: number;
+  topK: number;
+  topP: number;
+  version: string;
+};
+
+@Controller('v1beta')
+@UseGuards(ProxyGuard)
+export class GeminiController {
+  constructor(
+    @Inject(GeminiService) private readonly proxyService: GeminiService,
+    @Optional()
+    @Inject(AccountLeaseService)
+    private readonly accountLeaseService?: AccountLeaseService,
+    @Optional() @Inject(FilesService) private readonly files?: FilesService,
+    @Optional() @Inject(BatchService) private readonly batches?: BatchService,
+  ) {}
+
+  @Get('models')
+  listModels() {
+    const models = this.buildGeminiModelList();
+    return {
+      models,
+    };
+  }
+
+  @Get('models/:model')
+  getModel(@Param('model') model: string) {
+    const targetName = model.startsWith('models/') ? model : `models/${model}`;
+    const matched = this.buildGeminiModelList().find((item) => item.name === targetName);
+
+    if (matched) {
+      return {
+        name: matched.name,
+        displayName: matched.displayName,
+      };
+    }
+
+    return {
+      name: targetName,
+      displayName: targetName.replace(/^models\//, ''),
+    };
+  }
+
+  @Post('models/:modelAction')
+  async modelAction(
+    @Param('modelAction') modelAction: string,
+    @Body() body: GeminiRequest,
+    @Res() res: FastifyReply,
+    @Req() req?: FastifyRequest,
+  ) {
+    const parsed = this.parseModelActionToken(modelAction);
+    if (!parsed) {
+      res.status(HttpStatus.BAD_REQUEST).send({
+        error: {
+          code: HttpStatus.BAD_REQUEST,
+          message: 'Model action format is invalid',
+          status: 'INVALID_ARGUMENT',
+        },
+      });
+      return;
+    }
+
+    await this.handleModelActionDispatch(parsed.model, parsed.action, body, res, req);
+  }
+
+  @Post('models/:model/countTokens')
+  async countTokens(
+    @Param('model') model: string,
+    @Body() body: GeminiRequest,
+    @Res() res: FastifyReply,
+    @Req() req?: FastifyRequest,
+  ) {
+    await this.handleModelActionDispatch(`models/${model}`, 'countTokens', body, res, req);
+  }
+
+  private async handleModelActionDispatch(
+    model: string,
+    action: string,
+    body: GeminiRequest,
+    res: FastifyReply,
+    req?: FastifyRequest,
+  ): Promise<void> {
+    let request: GeminiRequest;
+    try {
+      // Handles become inline bytes before anything else reads the request:
+      // the upstream transport has no file plane to forward a `fileUri` to.
+      request = await expandFileReferences(body, 'gemini', this.files);
+    } catch (error) {
+      if (error instanceof FileReferenceError) {
+        res.status(error.httpStatus).send({
+          error: {
+            code: error.httpStatus,
+            message: error.message,
+            status: error.httpStatus === 404 ? 'NOT_FOUND' : 'INVALID_ARGUMENT',
+          },
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const abortScope = createProxyRequestAbortScope(req, res);
+    try {
+      if (action === 'countTokens') {
+        const totalTokens = await this.proxyService.handleGeminiCountTokens(model, request);
+        res.status(HttpStatus.OK).send({ totalTokens });
+        return;
+      }
+
+      if (action === 'streamGenerateContent') {
+        const stream = await (abortScope.signal
+          ? this.proxyService.handleGeminiStreamGenerateContent(model, request, abortScope.signal)
+          : this.proxyService.handleGeminiStreamGenerateContent(model, request));
+        if (stream instanceof Observable) {
+          writeProxySseResponse(res, stream, { includeTiming: true, request: req });
+          return;
+        }
+      }
+
+      if (action === 'generateContent') {
+        const result = await (abortScope.signal
+          ? this.proxyService.handleGeminiGenerateContent(
+              model,
+              request,
+              'generate-content',
+              abortScope.signal,
+            )
+          : this.proxyService.handleGeminiGenerateContent(model, request));
+        setProxyResponseTimingHeaders(res, req);
+        res.status(HttpStatus.OK).send(this.buildNormalizedGeminiGenerateResponse(result));
+        return;
+      }
+
+      if (action === 'batchGenerateContent') {
+        await respondGeminiBatchGenerateContent(this.batches, model, request, res);
+        return;
+      }
+
+      res.status(HttpStatus.BAD_REQUEST).send({
+        error: {
+          code: HttpStatus.BAD_REQUEST,
+          message: `Unsupported model action: ${action}`,
+          status: 'INVALID_ARGUMENT',
+        },
+      });
+    } catch (error) {
+      if (error instanceof InvalidCountTokensRequestError || error instanceof BadRequestException) {
+        res.status(HttpStatus.BAD_REQUEST).send({
+          error: {
+            code: HttpStatus.BAD_REQUEST,
+            message: error.message,
+            status: 'INVALID_ARGUMENT',
+          },
+        });
+        return;
+      }
+
+      const message = error instanceof Error ? error.message : 'Internal Server Error';
+      const status =
+        error instanceof HttpException
+          ? (error.getStatus() as HttpStatus)
+          : action === 'countTokens'
+            ? this.resolveCountTokensErrorHttpStatus(error)
+            : HttpStatus.INTERNAL_SERVER_ERROR;
+      applyProxyRetryAfterHeader(res, error);
+      res.status(status).send({
+        error: {
+          code: status,
+          message,
+          status: this.resolveGeminiErrorStatus(status),
+        },
+      });
+    } finally {
+      abortScope.dispose();
+    }
+  }
+
+  private resolveCountTokensErrorHttpStatus(error: unknown): HttpStatus {
+    if (
+      error instanceof UpstreamRequestError &&
+      Number.isInteger(error.status) &&
+      error.status !== undefined &&
+      error.status >= 400 &&
+      error.status <= 599
+    ) {
+      return error.status as HttpStatus;
+    }
+
+    return HttpStatus.INTERNAL_SERVER_ERROR;
+  }
+
+  private resolveGeminiErrorStatus(status: HttpStatus): string {
+    switch (status) {
+      case HttpStatus.BAD_REQUEST:
+        return 'INVALID_ARGUMENT';
+      case HttpStatus.UNAUTHORIZED:
+        return 'UNAUTHENTICATED';
+      case HttpStatus.FORBIDDEN:
+        return 'PERMISSION_DENIED';
+      case HttpStatus.NOT_FOUND:
+        return 'NOT_FOUND';
+      case HttpStatus.REQUEST_TIMEOUT:
+      case HttpStatus.GATEWAY_TIMEOUT:
+        return 'DEADLINE_EXCEEDED';
+      case HttpStatus.CONFLICT:
+        return 'ABORTED';
+      case HttpStatus.PRECONDITION_FAILED:
+        return 'FAILED_PRECONDITION';
+      case HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE:
+        return 'OUT_OF_RANGE';
+      case HttpStatus.TOO_MANY_REQUESTS:
+        return 'RESOURCE_EXHAUSTED';
+      case HttpStatus.NOT_IMPLEMENTED:
+        return 'UNIMPLEMENTED';
+      case HttpStatus.SERVICE_UNAVAILABLE:
+        return 'UNAVAILABLE';
+      default:
+        return 'INTERNAL';
+    }
+  }
+
+  private parseModelActionToken(modelAction: string): {
+    model: string;
+    action: string;
+  } | null {
+    const colonIndex = modelAction.lastIndexOf(':');
+    if (colonIndex <= 0) {
+      return null;
+    }
+
+    const model = modelAction.slice(0, colonIndex).trim();
+    const action = modelAction.slice(colonIndex + 1).trim();
+    if (!model || !action) {
+      return null;
+    }
+
+    const prefixedModel = model.startsWith('models/') ? model : `models/${model}`;
+    return {
+      model: prefixedModel,
+      action,
+    };
+  }
+
+  private buildGeminiModelList(): GeminiModelMetadata[] {
+    const config = getServerConfig();
+    const onlyRawQuotaModels = config?.only_raw_quota_models ?? false;
+    const collectedModelIds = onlyRawQuotaModels
+      ? this.accountLeaseService?.getAllRawQuotaModels()
+      : this.accountLeaseService?.getAllCollectedModels();
+    const dynamicModelIds = getAllDynamicModels(
+      getConfiguredModelMapping(config),
+      collectedModelIds,
+      onlyRawQuotaModels,
+    );
+
+    return dynamicModelIds.map((id) => this.toGeminiModelMetadata(`models/${id}`));
+  }
+
+  private toGeminiModelMetadata(modelName: string): GeminiModelMetadata {
+    const displayName = modelName.replace(/^models\//, '');
+    return {
+      name: modelName,
+      displayName,
+      description: '',
+      inputTokenLimit: 128000,
+      outputTokenLimit: 8192,
+      supportedGenerationMethods: ['generateContent', 'countTokens'],
+      temperature: 1,
+      topK: 64,
+      topP: 0.95,
+      version: '001',
+    };
+  }
+
+  private buildNormalizedGeminiGenerateResponse(response: GeminiResponse): GeminiResponse {
+    const candidates = (response.candidates ?? []).map((candidate, index) => ({
+      content: candidate.content,
+      finishReason: candidate.finishReason,
+      index: isNumber(candidate.index) ? candidate.index : index,
+    }));
+
+    const normalized: GeminiResponse = {
+      candidates,
+      promptFeedback: response.promptFeedback,
+    };
+
+    if (response.usageMetadata) {
+      const usageMetadata = this.normalizeGeminiUsageMetadata(response.usageMetadata);
+      if (!isEmpty(usageMetadata)) {
+        normalized.usageMetadata = usageMetadata;
+      }
+    }
+
+    return normalized;
+  }
+
+  private normalizeGeminiUsageMetadata(
+    usageMetadata: GeminiResponse['usageMetadata'],
+  ): NonNullable<GeminiResponse['usageMetadata']> {
+    const normalized: NonNullable<GeminiResponse['usageMetadata']> = {};
+    if (usageMetadata?.promptTokenCount !== undefined) {
+      normalized.promptTokenCount = usageMetadata.promptTokenCount;
+    }
+    if (usageMetadata?.candidatesTokenCount !== undefined) {
+      normalized.candidatesTokenCount = usageMetadata.candidatesTokenCount;
+    }
+    if (usageMetadata?.totalTokenCount !== undefined) {
+      normalized.totalTokenCount = usageMetadata.totalTokenCount;
+    }
+    if (usageMetadata?.thoughtsTokenCount !== undefined) {
+      normalized.thoughtsTokenCount = usageMetadata.thoughtsTokenCount;
+    }
+    if (usageMetadata?.promptTokensDetails !== undefined) {
+      normalized.promptTokensDetails = usageMetadata.promptTokensDetails;
+    }
+    if (usageMetadata?.candidatesTokensDetails !== undefined) {
+      normalized.candidatesTokensDetails = usageMetadata.candidatesTokensDetails;
+    }
+    if (usageMetadata?.trafficType !== undefined) {
+      normalized.trafficType = usageMetadata.trafficType;
+    }
+    return normalized;
+  }
+}

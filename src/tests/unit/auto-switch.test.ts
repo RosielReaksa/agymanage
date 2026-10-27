@@ -1,0 +1,674 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CloudAccount, CloudQuotaData } from '@/modules/cloud-account/types';
+
+vi.mock('@/modules/cloud-account/persistence/cloudHandler', () => ({
+  CloudAccountRepo: {
+    getAccounts: vi.fn(),
+  },
+}));
+
+vi.mock('@/modules/cloud-account/persistence/cloud-account-settings-store', () => ({
+  CloudAccountSettingsStore: {
+    getSetting: vi.fn(),
+    getActiveAccountIdForTarget: vi.fn(),
+  },
+}));
+
+vi.mock('@/modules/cloud-account/services/cloud-account-switch.service', () => ({
+  switchCloudAccountCore: vi.fn(),
+}));
+
+vi.mock('@/shared/logging/logger', () => ({
+  logger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+function createAccount(
+  id: string,
+  quota: CloudQuotaData,
+  options: Partial<CloudAccount> = {},
+): CloudAccount {
+  return {
+    id,
+    provider: 'google',
+    email: `${id}@example.com`,
+    token: {
+      access_token: 'access-token',
+      refresh_token: 'refresh-token',
+      expires_in: 3600,
+      expiry_timestamp: 1700000000,
+      token_type: 'Bearer',
+    },
+    quota,
+    created_at: 1700000000,
+    last_used: 1700000000,
+    status: 'active',
+    ...options,
+  };
+}
+
+function quotaWithClaudeGroup(modelPercentage: number, groupFraction: number): CloudQuotaData {
+  return {
+    models: {
+      'claude-sonnet-4-5': {
+        percentage: modelPercentage,
+        resetTime: '',
+      },
+    },
+    quota_groups: [
+      {
+        display_name: 'Claude and GPT models',
+        buckets: [
+          {
+            bucket_id: '3p-5h',
+            window: '5h',
+            remaining_fraction: groupFraction,
+            reset_time: '',
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function quotaWithArgonGroup(
+  models: CloudQuotaData['models'],
+  geminiWeeklyFraction: number,
+  argonWeeklyFraction: number,
+): CloudQuotaData {
+  return {
+    models,
+    quota_groups: [
+      {
+        display_name: 'Gemini Models',
+        description: 'Models within this group: Gemini Flash, Gemini Pro',
+        buckets: [
+          {
+            bucket_id: 'gemini-weekly',
+            window: 'weekly',
+            remaining_fraction: geminiWeeklyFraction,
+            reset_time: '',
+          },
+        ],
+      },
+      {
+        display_name: 'Gemini 4 Argon',
+        description:
+          'For paid Pro plans, Argon quota is separate. Higher Argon quota (included as part of the larger Gemini quota bucket) is available on Ultra plans.',
+        buckets: [
+          {
+            bucket_id: 'gemini-argon-wtu-weekly',
+            window: 'weekly',
+            remaining_fraction: argonWeeklyFraction,
+            reset_time: '',
+          },
+        ],
+      },
+    ],
+  };
+}
+
+describe('AutoSwitchService', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('skips an otherwise better account whose Claude/GPT group is exactly at 5%', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', quotaWithClaudeGroup(1, 0.01)),
+      createAccount('model-high-group-boundary', quotaWithClaudeGroup(90, 0.05)),
+      createAccount('model-medium-group-healthy', quotaWithClaudeGroup(45, 0.06)),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'model-medium-group-healthy',
+    });
+  });
+
+  it('respects enabled model configuration when checking depletion', async () => {
+    // eslint-disable-next-line unused-imports/no-unused-vars
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    const config = {
+      'claude-sonnet-4-5': { enabled: false, priority: false },
+      'gemini-pro': { enabled: true, priority: false },
+    };
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue(config);
+
+    const testAccount = createAccount('test-acc', {
+      models: {
+        'claude-sonnet-4-5': { percentage: 2, resetTime: '' },
+        'gemini-pro': { percentage: 90, resetTime: '' },
+      },
+    });
+
+    // Depleted should be false because claude-sonnet-4-5 is disabled!
+    expect(AutoSwitchService.isAccountDepleted(testAccount)).toBe(false);
+  });
+
+  it('applies unprefixed model settings to prefixed quota model identifiers', async () => {
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({
+      'claude-sonnet-4-5': { enabled: false, priority: false },
+      'gemini-pro': { enabled: true, priority: false },
+    });
+
+    const testAccount = createAccount('prefixed-models', {
+      models: {
+        'models/claude-sonnet-4-5': { percentage: 1, resetTime: '' },
+        'models/gemini-pro': { percentage: 90, resetTime: '' },
+      },
+    });
+
+    expect(AutoSwitchService.isAccountDepleted(testAccount)).toBe(false);
+  });
+
+  it('uses unprefixed priority settings when quota identifiers are prefixed', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({
+      'claude-sonnet-4-5': { enabled: true, priority: true },
+      'gemini-pro': { enabled: true, priority: false },
+    });
+
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', {
+        models: {
+          'models/claude-sonnet-4-5': { percentage: 50, resetTime: '' },
+          'models/gemini-pro': { percentage: 90, resetTime: '' },
+        },
+      }),
+      createAccount('priority-high', {
+        models: {
+          'models/claude-sonnet-4-5': { percentage: 80, resetTime: '' },
+          'models/gemini-pro': { percentage: 10, resetTime: '' },
+        },
+      }),
+      createAccount('priority-low', {
+        models: {
+          'models/claude-sonnet-4-5': { percentage: 60, resetTime: '' },
+          'models/gemini-pro': { percentage: 95, resetTime: '' },
+        },
+      }),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'priority-high',
+    });
+  });
+
+  it('uses the best quota in an alias group and treats each enabled group at 5% as depleted', async () => {
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    const accountWithHealthySibling = createAccount('healthy-sibling', {
+      models: {
+        'gemini-3.1-pro-low': { percentage: 0, resetTime: '' },
+        'gemini-3.1-pro-high': { percentage: 80, resetTime: '' },
+      },
+    });
+    const accountAtBoundary = createAccount('at-boundary', {
+      models: {
+        'gemini-3.1-pro-low': { percentage: 0, resetTime: '' },
+        'gemini-3.1-pro-high': { percentage: 80, resetTime: '' },
+        'gemini-3.1-flash-image': { percentage: 5, resetTime: '' },
+      },
+    });
+    const accountAboveBoundary = createAccount('above-boundary', {
+      models: {
+        'gemini-3.1-pro-low': { percentage: 0, resetTime: '' },
+        'gemini-3.1-pro-high': { percentage: 80, resetTime: '' },
+        'gemini-3.1-flash-image': { percentage: 6, resetTime: '' },
+      },
+    });
+    const accountWithDepletedGroup = createAccount('depleted-group', {
+      models: {
+        'gemini-3.1-pro-low': { percentage: 0, resetTime: '' },
+        'gemini-3.1-pro-high': { percentage: 4, resetTime: '' },
+      },
+    });
+
+    expect({
+      healthySibling: AutoSwitchService.isAccountDepleted(accountWithHealthySibling),
+      atBoundary: AutoSwitchService.isAccountDepleted(accountAtBoundary),
+      aboveBoundary: AutoSwitchService.isAccountDepleted(accountAboveBoundary),
+      depletedGroup: AutoSwitchService.isAccountDepleted(accountWithDepletedGroup),
+    }).toEqual({
+      healthySibling: false,
+      atBoundary: true,
+      aboveBoundary: false,
+      depletedGroup: true,
+    });
+  });
+
+  it.each([
+    ['weekly', 0.05],
+    ['5h', 0.05],
+    ['weekly', 0.054],
+  ])('treats a relevant %s quota bucket at rounded 5%% as depleted', async (window, fraction) => {
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+    const account = createAccount(`rounded-boundary-${window}-${fraction}`, {
+      models: {
+        'gemini-3.5-flash': { percentage: 90, resetTime: '' },
+      },
+      quota_groups: [
+        {
+          display_name: 'Gemini models',
+          buckets: [
+            {
+              bucket_id: `gemini-${window}`,
+              window,
+              remaining_fraction: fraction,
+              reset_time: '',
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(AutoSwitchService.isAccountDepleted(account)).toBe(true);
+  });
+
+  it('keeps rounded 6% and unrelated 5% quota buckets healthy', async () => {
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+    const roundedSix = createAccount('rounded-six', {
+      models: {
+        'gemini-3.5-flash': { percentage: 90, resetTime: '' },
+      },
+      quota_groups: [
+        {
+          display_name: 'Gemini models',
+          buckets: [
+            {
+              bucket_id: 'gemini-weekly',
+              window: 'weekly',
+              remaining_fraction: 0.055,
+              reset_time: '',
+            },
+          ],
+        },
+      ],
+    });
+    const unrelatedBoundary = createAccount('unrelated-boundary', {
+      models: {
+        'gemini-3.5-flash': { percentage: 90, resetTime: '' },
+      },
+      quota_groups: [
+        {
+          display_name: 'Claude and GPT models',
+          buckets: [
+            {
+              bucket_id: '3p-weekly',
+              window: 'weekly',
+              remaining_fraction: 0.05,
+              reset_time: '',
+            },
+          ],
+        },
+      ],
+    });
+
+    expect({
+      roundedSix: AutoSwitchService.isAccountDepleted(roundedSix),
+      unrelatedBoundary: AutoSwitchService.isAccountDepleted(unrelatedBoundary),
+    }).toEqual({
+      roundedSix: false,
+      unrelatedBoundary: false,
+    });
+  });
+
+  it('returns no best account when the only candidate is exactly at the depletion boundary', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', quotaWithClaudeGroup(50, 0.5)),
+      createAccount('only-boundary-candidate', quotaWithClaudeGroup(90, 0.05)),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toBeNull();
+  });
+
+  it('matches depleted quota groups for models-prefixed identifiers', async () => {
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    const prefixedModelAccount = createAccount('prefixed-model', {
+      models: {
+        'models/gemini-flash': { percentage: 90, resetTime: '' },
+      },
+      quota_groups: [
+        {
+          display_name: 'Gemini models',
+          buckets: [
+            {
+              bucket_id: 'gemini-group',
+              window: '5h',
+              remaining_fraction: 0.01,
+              reset_time: '',
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(AutoSwitchService.isAccountDepleted(prefixedModelAccount)).toBe(true);
+  });
+
+  it('prioritizes priority models during best account selection', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    const config = {
+      'claude-sonnet-4-5': { enabled: true, priority: true },
+      'gemini-pro': { enabled: true, priority: false },
+    };
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue(config);
+
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', {
+        models: {
+          'claude-sonnet-4-5': { percentage: 50, resetTime: '' },
+          'gemini-pro': { percentage: 90, resetTime: '' },
+        },
+      }),
+      // Acc A has lower overall average (45% vs 75%) but HIGHER priority model percentage (80% vs 60%)
+      createAccount('acc-a', {
+        models: {
+          'claude-sonnet-4-5': { percentage: 80, resetTime: '' },
+          'gemini-pro': { percentage: 10, resetTime: '' },
+        },
+      }),
+      createAccount('acc-b', {
+        models: {
+          'claude-sonnet-4-5': { percentage: 60, resetTime: '' },
+          'gemini-pro': { percentage: 90, resetTime: '' },
+        },
+      }),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'acc-a',
+    });
+  });
+
+  it('prefers an account that exposes a configured priority model over a higher fallback score', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({
+      'claude-sonnet-4-5': { enabled: true, priority: true },
+      'gemini-pro': { enabled: true, priority: false },
+    });
+
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', {
+        models: {
+          'claude-sonnet-4-5': { percentage: 50, resetTime: '' },
+        },
+      }),
+      createAccount('priority-present', {
+        models: {
+          'claude-sonnet-4-5': { percentage: 60, resetTime: '' },
+          'gemini-pro': { percentage: 10, resetTime: '' },
+        },
+      }),
+      createAccount('priority-missing', {
+        models: {
+          'gemini-pro': { percentage: 100, resetTime: '' },
+        },
+      }),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'priority-present',
+    });
+  });
+
+  it('uses the minimum across every related quota bucket when ranking accounts', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({});
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', quotaWithClaudeGroup(50, 0.5)),
+      createAccount('model-high-weekly-low', {
+        models: { 'claude-sonnet-4-5': { percentage: 90, resetTime: '' } },
+        quota_groups: [
+          {
+            display_name: 'Claude and GPT models',
+            buckets: [
+              {
+                bucket_id: '3p-5h',
+                window: '5h',
+                remaining_fraction: 0.8,
+                reset_time: '',
+              },
+              {
+                bucket_id: '3p-weekly',
+                window: 'weekly',
+                remaining_fraction: 0.06,
+                reset_time: '',
+              },
+            ],
+          },
+        ],
+      }),
+      createAccount('model-medium-buckets-healthy', quotaWithClaudeGroup(60, 0.6)),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'model-medium-buckets-healthy',
+    });
+  });
+
+  it('scores priority and fallback cohorts against only their related quota groups', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({
+      'claude-sonnet-4-5': { enabled: true, priority: true },
+      'gemini-3.5-flash': { enabled: true, priority: false },
+    });
+
+    const createRankedAccount = (
+      id: string,
+      claudePercentage: number,
+      geminiPercentage: number,
+      claudeGroupFraction: number,
+      geminiGroupFraction: number,
+    ) =>
+      createAccount(id, {
+        models: {
+          'claude-sonnet-4-5': { percentage: claudePercentage, resetTime: '' },
+          'gemini-3.5-flash': { percentage: geminiPercentage, resetTime: '' },
+        },
+        quota_groups: [
+          {
+            display_name: 'Claude and GPT models',
+            buckets: [
+              {
+                bucket_id: '3p-weekly',
+                window: 'weekly',
+                remaining_fraction: claudeGroupFraction,
+                reset_time: '',
+              },
+            ],
+          },
+          {
+            display_name: 'Gemini models',
+            buckets: [
+              {
+                bucket_id: 'gemini-weekly',
+                window: 'weekly',
+                remaining_fraction: geminiGroupFraction,
+                reset_time: '',
+              },
+            ],
+          },
+        ],
+      });
+
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createRankedAccount('current', 50, 50, 0.5, 0.5),
+      createRankedAccount('raw-priority-high', 100, 90, 0.4, 0.1),
+      createRankedAccount('fallback-healthier', 40, 30, 0.8, 0.9),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'fallback-healthier',
+    });
+  });
+
+  it('does not let an unrelated quota group lower a cohort score', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({});
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', {
+        models: { 'gemini-3.5-flash': { percentage: 50, resetTime: '' } },
+      }),
+      createAccount('gemini-high-with-unrelated-group', {
+        models: { 'gemini-3.5-flash': { percentage: 90, resetTime: '' } },
+        quota_groups: [
+          {
+            display_name: 'Claude and GPT models',
+            buckets: [
+              {
+                bucket_id: '3p-weekly',
+                window: 'weekly',
+                remaining_fraction: 0.06,
+                reset_time: '',
+              },
+            ],
+          },
+        ],
+      }),
+      createAccount('gemini-medium', {
+        models: { 'gemini-3.5-flash': { percentage: 50, resetTime: '' } },
+      }),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'gemini-high-with-unrelated-group',
+    });
+  });
+
+  it('preserves source order when every score is tied', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({});
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', quotaWithClaudeGroup(50, 0.5)),
+      createAccount('first', quotaWithClaudeGroup(60, 0.6)),
+      createAccount('second', quotaWithClaudeGroup(60, 0.6)),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'first',
+    });
+  });
+
+  it('applies a depleted Gemini 4 Argon group only to enabled Argon models', async () => {
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    const flashOnly = createAccount(
+      'flash-only',
+      quotaWithArgonGroup({ 'gemini-3.8-flash-high': { percentage: 90, resetTime: '' } }, 0.9, 0),
+    );
+    const withArgonModel = createAccount(
+      'with-argon-model',
+      quotaWithArgonGroup(
+        {
+          'gemini-3.8-flash-high': { percentage: 90, resetTime: '' },
+          'models/gemini-4-argon-high': { percentage: 80, resetTime: '' },
+        },
+        0.9,
+        0,
+      ),
+    );
+
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({});
+    const argonEnabled = {
+      flashOnly: AutoSwitchService.isAccountDepleted(flashOnly),
+      withArgonModel: AutoSwitchService.isAccountDepleted(withArgonModel),
+    };
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({
+      'gemini-4-argon-high': { enabled: false, priority: false },
+    });
+    const argonDisabled = AutoSwitchService.isAccountDepleted(withArgonModel);
+
+    expect({ argonEnabled, argonDisabled }).toEqual({
+      argonEnabled: { flashOnly: false, withArgonModel: true },
+      argonDisabled: false,
+    });
+  });
+
+  it('does not let a dedicated Gemini 4 Argon group lower other Gemini cohort scores', async () => {
+    const { CloudAccountRepo } = await import('@/modules/cloud-account/persistence/cloudHandler');
+    const { CloudAccountSettingsStore } =
+      await import('@/modules/cloud-account/persistence/cloud-account-settings-store');
+    const { AutoSwitchService } =
+      await import('@/modules/cloud-account/services/AutoSwitchService');
+
+    const flash = (percentage: number) => ({
+      'gemini-3.8-flash-high': { percentage, resetTime: '' },
+    });
+    vi.mocked(CloudAccountSettingsStore.getSetting).mockReturnValue({});
+    vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue([
+      createAccount('current', quotaWithArgonGroup(flash(50), 0.5, 1)),
+      createAccount('flash-high-argon-exhausted', quotaWithArgonGroup(flash(90), 0.9, 0)),
+      createAccount('flash-medium-argon-full', quotaWithArgonGroup(flash(60), 0.6, 1)),
+    ]);
+
+    await expect(AutoSwitchService.findBestAccount('current')).resolves.toMatchObject({
+      id: 'flash-high-argon-exhausted',
+    });
+  });
+});

@@ -1,0 +1,19 @@
+assert_lefthook_installed: true
+lefthook: node scripts/git/run-lefthook.mjs
+
+pre-commit:
+  piped: true
+  jobs:
+    - name: staged-whitespace
+      run: git diff --cached --check
+    - name: agent-contracts
+      run: node scripts/git/check-staged-governance.mjs
+    - name: staged-lint
+      run: node scripts/git/check-staged-lint.mjs
+    - name: previous-pre-commit
+      run: node scripts/git/run-previous-pre-commit.mjs
+
+pre-push:
+  jobs:
+    - name: type-check
+      run: pnpm run type-check

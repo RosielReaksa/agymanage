@@ -1,0 +1,367 @@
+import 'reflect-metadata';
+import fs from 'node:fs';
+import path from 'node:path';
+import mime from 'mime-types';
+import { NestFactory } from '@nestjs/core';
+import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
+import fastifyMultipart from '@fastify/multipart';
+import { AppModule } from './app.module';
+import { logger } from '../shared/logging/logger';
+import { AccountLeaseService } from '../modules/proxy-gateway/server/modules/account-lease/account-lease.service';
+import { OpenAIOperations } from '../modules/proxy-gateway/server/modules/openai/openai-operations.service';
+import { ProxyService } from '../modules/proxy-gateway/server/proxy.service';
+import { DEFAULT_MAX_FILE_BYTES } from '../modules/proxy-gateway/server/modules/files/file-store.types';
+import { attachOpenAIResponsesWebSocketServer } from '../modules/proxy-gateway/server/modules/openai/responses/openai-responses-websocket.server';
+import { createResponsesWebSocketOperations } from '@/modules/proxy-gateway/server/modules/openai/responses/openai-responses-websocket.operations';
+import {
+  extractApiKeyToken,
+  hasConfiguredApiKey,
+} from '../modules/proxy-gateway/server/guards/api-key-auth.util';
+import { MAX_IMAGE_GENERATION_BODY_BYTES } from '@/modules/proxy-gateway/server/modules/openai/media/image-input-validation';
+import {
+  DEFAULT_PROXY_JSON_BODY_LIMIT_BYTES,
+  isModelPayloadRoute,
+} from '../modules/proxy-gateway/server/proxy.constants';
+import { registerTrafficAuditHttpHooks } from '@/modules/proxy-gateway/audit/traffic-audit-context';
+import { trafficAuditService } from '@/modules/proxy-gateway/audit/traffic-audit.service';
+import { thoughtStoreService } from '@/modules/proxy-gateway/thought-store/thought-store.service';
+
+import { ProxyConfig } from '@/modules/config/types';
+import { getServerConfig, setServerConfig } from './server-config';
+
+let app: NestFastifyApplication | null = null;
+let currentPort: number = 0;
+let detachResponsesWebSocketServer: (() => void) | null = null;
+let webModeProxyRunning: boolean = true;
+
+export type NestServerStartResult =
+  | {
+      success: true;
+      port: number;
+      base_url: string;
+    }
+  | {
+      success: false;
+      reason: 'address-in-use' | 'unknown';
+      port: number;
+      message: string;
+    };
+
+interface RawMediaBodyParserHost {
+  addContentTypeParser: (
+    matcher: RegExp,
+    options: { bodyLimit: number; parseAs: 'buffer' },
+    handler: (request: unknown, body: Buffer, done: (error: null, body: Buffer) => void) => void,
+  ) => void;
+}
+
+interface RouteLimitHost {
+  addHook: (
+    name: 'onRoute',
+    handler: (options: { bodyLimit?: number; method: string | string[]; url: string }) => void,
+  ) => void;
+}
+
+export function registerImageGenerationBodyLimit(instance: RouteLimitHost): void {
+  instance.addHook('onRoute', (options) => {
+    const methods = Array.isArray(options.method) ? options.method : [options.method];
+    if (methods.includes('POST') && options.url === '/v1/images/generations') {
+      options.bodyLimit = MAX_IMAGE_GENERATION_BODY_BYTES;
+    }
+  });
+}
+
+export function registerModelRouteBodyLimits(instance: RouteLimitHost): void {
+  instance.addHook('onRoute', (options) => {
+    const methods = Array.isArray(options.method) ? options.method : [options.method];
+    if (methods.includes('POST') && isModelPayloadRoute(options.url)) {
+      options.bodyLimit = DEFAULT_PROXY_JSON_BODY_LIMIT_BYTES;
+    }
+  });
+}
+
+/**
+ * Lets `POST /upload/v1beta/files` accept Google's simple media form, where the
+ * whole request body is the file and `Content-Type` names its type.
+ *
+ * Registered for media families only, and with its own body limit rather than
+ * the server's: `application/json` and `multipart/form-data` already have
+ * exact-match parsers, Fastify prefers an exact match over a matcher, so every
+ * existing route keeps both its parser and its current ceiling.
+ */
+function registerRawMediaBodyParser(instance: RawMediaBodyParserHost): void {
+  instance.addContentTypeParser(
+    /^(?:application|audio|font|image|model|text|video)\//u,
+    { bodyLimit: DEFAULT_MAX_FILE_BYTES + 1024 * 1024, parseAs: 'buffer' },
+    (_request, body, done) => {
+      done(null, body);
+    },
+  );
+}
+
+function isAddressInUseError(error: unknown): boolean {
+  if ((typeof error !== 'object' && typeof error !== 'function') || error === null) {
+    return false;
+  }
+
+  return Reflect.get(error, 'code') === 'EADDRINUSE';
+}
+
+async function cleanupFailedServerStart() {
+  if (!app) {
+    return;
+  }
+
+  try {
+    detachResponsesWebSocketServer?.();
+    detachResponsesWebSocketServer = null;
+    await app.close();
+  } catch (closeError) {
+    logger.warn('Failed to clean up NestJS server after startup failure', closeError);
+  } finally {
+    app = null;
+    currentPort = 0;
+  }
+}
+
+export function createFastifyAdapter(): FastifyAdapter {
+  const adapter = new FastifyAdapter();
+  registerImageGenerationBodyLimit(adapter.getInstance());
+  registerModelRouteBodyLimits(adapter.getInstance());
+  return adapter;
+}
+
+export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServerStartResult> {
+  const port = config.port || 8045;
+  if (app) {
+    webModeProxyRunning = true;
+    logger.info('NestJS server already running.');
+    return {
+      success: true,
+      port: currentPort,
+      base_url: `http://localhost:${currentPort}`,
+    };
+  }
+
+  setServerConfig(config);
+
+  try {
+    const fastifyAdapter = createFastifyAdapter();
+    registerTrafficAuditHttpHooks(fastifyAdapter.getInstance());
+    app = await NestFactory.create<NestFastifyApplication>(AppModule, fastifyAdapter, {
+      logger: ['error', 'warn', 'log'],
+    });
+
+    await app.register(fastifyMultipart, {
+      limits: {
+        files: 16,
+        fileSize: 100 * 1024 * 1024,
+        fields: 32,
+      },
+    });
+    registerRawMediaBodyParser(fastifyAdapter.getInstance() as RawMediaBodyParserHost);
+
+    const fastifyInstance = fastifyAdapter.getInstance() as any;
+
+    // Register oRPC handler for web browser access
+    try {
+      const { RPCHandler } = await import('@orpc/server/fastify');
+      const { router: orpcRouter } = await import('@/ipc/router');
+      const rpcHandler = new RPCHandler(orpcRouter);
+
+      if (typeof fastifyInstance.all === 'function') {
+        fastifyInstance.all('/rpc*', async (req: any, reply: any) => {
+          const result = await rpcHandler.handle(req, reply, { prefix: '/rpc' });
+          if (!result.matched) {
+            reply.status(404).send({ error: 'RPC route not found' });
+          }
+        });
+        logger.info('Registered /rpc handler for web interface');
+      }
+    } catch (rpcErr) {
+      logger.warn('Could not register /rpc handler', rpcErr);
+    }
+
+    // Serve web dashboard from dist/ directory if available
+    const staticDir = path.resolve(process.cwd(), 'dist');
+    if (fs.existsSync(staticDir) && typeof fastifyInstance.get === 'function') {
+      fastifyInstance.get('/*', async (req: any, reply: any) => {
+        const rawUrl = (req.raw?.url || req.url || '').split('?')[0];
+        if (
+          rawUrl.startsWith('/v1') ||
+          rawUrl.startsWith('/rpc') ||
+          rawUrl.startsWith('/upload')
+        ) {
+          reply.status(404).send({ error: 'Not Found' });
+          return;
+        }
+
+        const safePath = path.normalize(rawUrl).replace(/^(\.\.[\/\\])+/, '');
+        const filePath = path.join(staticDir, safePath);
+
+        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+          const mimeType = mime.lookup(filePath) || 'application/octet-stream';
+          reply.type(mimeType);
+          return fs.createReadStream(filePath);
+        }
+
+        const indexPath = path.join(staticDir, 'index.html');
+        if (fs.existsSync(indexPath)) {
+          reply.type('text/html');
+          return fs.createReadStream(indexPath);
+        }
+
+        reply.status(404).send('Not Found');
+      });
+      logger.info(`Web UI static files mapped from ${staticDir}`);
+    }
+
+    const apiKeyConfigured = hasConfiguredApiKey(config.api_key);
+    if (apiKeyConfigured || process.env.WEB_SERVER_MODE === '1') {
+      app.enableCors({ origin: true, credentials: true });
+    }
+
+    const listenHost = apiKeyConfigured ? '0.0.0.0' : '127.0.0.1';
+    await app.listen(port, listenHost);
+    const openAIOperations = app.get(OpenAIOperations);
+    const proxyService = app.get(ProxyService);
+    detachResponsesWebSocketServer = attachOpenAIResponsesWebSocketServer(app.getHttpServer(), {
+      ...createResponsesWebSocketOperations(openAIOperations, proxyService),
+      isAuthorized: (request) => {
+        const configuredApiKey = getConfiguredApiKey();
+        return (
+          !hasConfiguredApiKey(configuredApiKey) ||
+          extractApiKeyToken(request.headers) === configuredApiKey
+        );
+      },
+    });
+    currentPort = port;
+    logger.info(`NestJS Proxy Server running on http://localhost:${port}`);
+    return {
+      success: true,
+      port,
+      base_url: `http://localhost:${port}`,
+    };
+  } catch (error) {
+    await cleanupFailedServerStart();
+
+    if (isAddressInUseError(error)) {
+      const message = `Port ${port} is already in use`;
+      logger.warn(`NestJS Proxy Server could not start: ${message}`, error);
+      return {
+        success: false,
+        reason: 'address-in-use',
+        port,
+        message,
+      };
+    }
+
+    logger.error('Failed to start NestJS server', error);
+    return {
+      success: false,
+      reason: 'unknown',
+      port,
+      message: error instanceof Error ? error.message : 'Failed to start NestJS server',
+    };
+  }
+}
+
+export async function stopNestServer(): Promise<boolean> {
+  if (process.env.WEB_SERVER_MODE === '1') {
+    webModeProxyRunning = false;
+    logger.info('Web Server Mode: Gateway proxy stopped (web dashboard stays online).');
+    return true;
+  }
+
+  if (app) {
+    try {
+      detachResponsesWebSocketServer?.();
+      detachResponsesWebSocketServer = null;
+      await app.close();
+      const storeResults = await Promise.allSettled([
+        trafficAuditService.close(),
+        thoughtStoreService.close(),
+      ]);
+      const failures = storeResults.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length > 0) {
+        throw new AggregateError(failures, 'Gateway diagnostic stores did not close');
+      }
+      app = null;
+      currentPort = 0;
+      logger.info('NestJS server stopped.');
+      return true;
+    } catch (e) {
+      logger.error('Failed to stop NestJS server', e);
+      return false;
+    }
+  }
+  return true;
+}
+
+export function isNestServerRunning(): boolean {
+  return app !== null;
+}
+
+export async function reloadNestServerAccountLeaseCache(): Promise<boolean> {
+  if (!app) {
+    return false;
+  }
+
+  const accountLeaseService = app.get(AccountLeaseService);
+  await accountLeaseService.reloadAllAccountsOrThrow();
+  return true;
+}
+
+export function evictNestServerAccountLeaseAccount(accountId: string): boolean {
+  if (!app) {
+    return false;
+  }
+
+  return app.get(AccountLeaseService).evictAccount(accountId);
+}
+
+export function updateNestServerAccountLeaseOAuthHealth(
+  accountId: string,
+  oauthHealth: Parameters<AccountLeaseService['updateAccountOAuthHealth']>[1],
+): boolean {
+  if (!app) {
+    return false;
+  }
+
+  return app.get(AccountLeaseService).updateAccountOAuthHealth(accountId, oauthHealth);
+}
+
+function getConfiguredApiKey(): string | undefined {
+  return getServerConfig()?.api_key;
+}
+
+export async function getNestServerStatus(): Promise<{
+  running: boolean;
+  port: number;
+  base_url: string;
+  active_accounts: number;
+}> {
+  const running =
+    process.env.WEB_SERVER_MODE === '1'
+      ? webModeProxyRunning && isNestServerRunning()
+      : isNestServerRunning();
+  let activeAccounts = 0;
+
+  if (app) {
+    try {
+      const accountLeaseService = app.get(AccountLeaseService);
+      activeAccounts = accountLeaseService.getAccountCount();
+    } catch {
+      // AccountLeaseService might not be available
+    }
+  }
+
+  return {
+    running,
+    port: currentPort,
+    base_url: running ? `http://localhost:${currentPort}` : '',
+    active_accounts: activeAccounts,
+  };
+}

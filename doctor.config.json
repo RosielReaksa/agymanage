@@ -1,0 +1,20 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "blocking": "error",
+  "ignore": {
+    "files": [
+      "src/routeTree.gen.ts",
+      "src/tests/**",
+      "src/mocks/**",
+      ".codex-worktrees/**",
+      "artifacts/**",
+      "out/**"
+    ]
+  },
+  "noScore": true,
+  "scope": "lines",
+  "share": false,
+  "supplyChain": {
+    "enabled": false
+  }
+}

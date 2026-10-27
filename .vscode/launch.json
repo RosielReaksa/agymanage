@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Main Process",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "pnpm", "run", "start"],
+      "sourceMaps": true,
+      "outFiles": ["${workspaceFolder}/.vite/build/**/*.js"],
+      "console": "integratedTerminal",
+      "autoAttachChildProcesses": true
+    },
+    {
+      "name": "Debug Main Process (Proxyman)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "pnpm", "run", "start"],
+      "sourceMaps": true,
+      "outFiles": ["${workspaceFolder}/.vite/build/**/*.js"],
+      "console": "integratedTerminal",
+      "autoAttachChildProcesses": true,
+      "env": {
+        "NODE_USE_ENV_PROXY": "1",
+        "HTTP_PROXY": "http://127.0.0.1:9090",
+        "HTTPS_PROXY": "http://127.0.0.1:9090",
+        "ALL_PROXY": "http://127.0.0.1:9090",
+        "NO_PROXY": "localhost,127.0.0.1,::1",
+        "ELECTRON_PROXY_SERVER": "http://127.0.0.1:9090",
+        "ELECTRON_PROXY_BYPASS_LIST": "<local>;localhost;127.0.0.1;::1",
+        "DEBUG_PROXY_TRACE": "1",
+        "NODE_EXTRA_CA_CERTS": "C:\\Users\\Administrator\\AppData\\Roaming\\Proxyman\\certificate\\certs\\ca.pem",
+        "NODE_TLS_REJECT_UNAUTHORIZED": "0"
+      }
+    }
+  ]
+}

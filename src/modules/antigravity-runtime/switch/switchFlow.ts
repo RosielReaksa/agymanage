@@ -1,0 +1,357 @@
+import type { AntigravityAppTarget } from '@/shared/platform/antigravityAppTarget';
+import type { DeviceProfile } from '@/modules/identity-profile/types';
+import { logger } from '@/shared/logging/logger';
+import { AppError } from '@/shared/errors/appError';
+import type { PathResolutionOptions } from '@/shared/platform/paths';
+import { prepareLaunchContext } from '../launchContext';
+import { startFromContext } from '../launch';
+import { stopFromContext } from '../stop';
+import { processError } from '../processErrors';
+import { prepareIdeHotSwitch } from '../ideHotSwitch';
+import type { LaunchContext } from '../types';
+import {
+  applyDeviceProfile,
+  ensureIdentityProfileStorage,
+  syncTelemetryServiceMachineIdValue,
+} from '@/modules/identity-profile/ipc/handler';
+import {
+  type SwitchFailureReason,
+  recordSwitchFailure,
+  recordSwitchSuccess,
+} from '@/modules/antigravity-runtime/switch/switchMetrics';
+import { prepareClassicTermsSwitch, type ClassicTermsSwitch } from '../terms/classicTermsSwitch';
+import { withTimingTrace } from '@/shared/observability/timingTrace';
+
+export interface SwitchFlowOptions {
+  onDiagnosticStage?(
+    stage: 'identity-preparation' | 'target-write' | 'process-close' | 'process-start',
+  ): void;
+  scope: 'local' | 'cloud';
+  accountEmail?: string;
+  targetProfile: DeviceProfile | null;
+  appTarget?: AntigravityAppTarget;
+  applyFingerprint: boolean;
+  useCredentialStore: boolean;
+  processExitTimeoutMs: number;
+  launchContext?: LaunchContext;
+  performSwitch: (pathOptions?: PathResolutionOptions) => Promise<void>;
+  afterSwitchSuccess?: () => Promise<void>;
+  onFailure?: (reason: SwitchFailureReason) => void;
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function applyDeviceProfileBestEffort(
+  profile: DeviceProfile | null,
+  appTarget: AntigravityAppTarget | undefined,
+): void {
+  if (!profile) {
+    return;
+  }
+
+  try {
+    applyDeviceProfile(profile, appTarget);
+  } catch (error) {
+    logger.warn(
+      'Skipping device profile apply because credential-store-backed targets do not require storage.json',
+      error,
+    );
+  }
+}
+
+function syncTelemetryServiceMachineIdBestEffort(
+  profile: DeviceProfile | null,
+  appTarget: AntigravityAppTarget | undefined,
+  pathOptions?: PathResolutionOptions,
+): void {
+  if (!profile) {
+    return;
+  }
+
+  try {
+    syncTelemetryServiceMachineIdValue(profile.macMachineId, undefined, appTarget, pathOptions);
+  } catch (error) {
+    logger.warn('Skipping telemetry.serviceMachineId sync after SQLite token injection', error);
+  }
+}
+
+function toSwitchFailureReason(stage: string, error: unknown): SwitchFailureReason {
+  if (stage === 'close' || stage === 'hot_stop') {
+    return 'process_close_failed';
+  }
+  if (stage === 'missing_profile') {
+    return 'missing_bound_profile';
+  }
+  if (stage === 'apply') {
+    return 'apply_device_profile_failed';
+  }
+  if (stage === 'switch') {
+    return 'perform_switch_failed';
+  }
+  if (stage === 'start' || stage === 'hot_confirm') {
+    return 'start_process_failed';
+  }
+
+  // Keep legacy compatibility with reason encoded in thrown errors.
+  if (error instanceof Error && error.message.includes('missing bound device profile')) {
+    return 'missing_bound_profile';
+  }
+  if (error instanceof Error && error.message.includes('device_apply_failed')) {
+    return 'apply_device_profile_failed';
+  }
+  return 'unknown';
+}
+
+export async function executeSwitchFlow(options: SwitchFlowOptions): Promise<void> {
+  const {
+    scope,
+    appTarget,
+    targetProfile,
+    applyFingerprint,
+    useCredentialStore,
+    processExitTimeoutMs,
+    launchContext,
+    performSwitch,
+    afterSwitchSuccess,
+    onFailure,
+  } = options;
+
+  let failureReason: SwitchFailureReason | null = null;
+  let exitUnconfirmed = false;
+  let stage = 'close';
+  let switchMode = 'restart';
+  const isCliTarget = appTarget === 'agy';
+  await withTimingTrace(
+    'switch.execute',
+    {
+      scope,
+      appTarget: appTarget || 'classic',
+      processExitTimeoutMs,
+    },
+    async (trace) => {
+      let terms: ClassicTermsSwitch | null = null;
+      let startAttempted = false;
+      try {
+        if (isCliTarget) {
+          logger.info('Skipping GUI process steps for agy CLI switch');
+          stage = 'switch';
+          options.onDiagnosticStage?.('target-write');
+          await trace.phase('performSwitchMs', () => performSwitch());
+          if (applyFingerprint) {
+            stage = 'apply';
+            trace.phaseSync('applyProfileMs', () => {
+              applyDeviceProfileBestEffort(targetProfile, appTarget);
+            });
+          }
+          if (afterSwitchSuccess) {
+            stage = 'after_success';
+            await trace.phase('afterSwitchSuccessMs', afterSwitchSuccess);
+          }
+          recordSwitchSuccess(scope);
+          return;
+        }
+
+        stage = 'preflight';
+        const context =
+          launchContext || (await prepareLaunchContext(appTarget === 'ide' ? 'ide' : 'classic'));
+        const hotSession = !useCredentialStore ? await prepareIdeHotSwitch(context) : null;
+        if (useCredentialStore && options.accountEmail) {
+          terms = await prepareClassicTermsSwitch(context, options.accountEmail);
+        }
+        if (applyFingerprint) {
+          if (!targetProfile && !(process.platform === 'darwin' && useCredentialStore)) {
+            stage = 'missing_profile';
+            throw new Error('Account has no bound identity profile');
+          }
+          stage = 'apply';
+          if (!(process.platform === 'darwin' && useCredentialStore)) {
+            ensureIdentityProfileStorage(appTarget, context.pathOptions);
+          }
+        }
+        const writeSwitchState = async (applyProfile = true) => {
+          if (
+            applyProfile &&
+            applyFingerprint &&
+            targetProfile &&
+            !(process.platform === 'darwin' && useCredentialStore)
+          ) {
+            stage = 'apply';
+            trace.phaseSync('applyProfileMs', () => {
+              applyDeviceProfile(targetProfile, appTarget, context.pathOptions);
+            });
+          }
+          stage = 'switch';
+          options.onDiagnosticStage?.('target-write');
+          await trace.phase('performSwitchMs', () => performSwitch(context.pathOptions));
+          if (
+            applyProfile &&
+            applyFingerprint &&
+            targetProfile &&
+            process.platform === 'darwin' &&
+            useCredentialStore
+          ) {
+            stage = 'apply';
+            try {
+              applyDeviceProfile(targetProfile, appTarget, context.pathOptions);
+            } catch {
+              // Native targets can have no storage.json after the credential write succeeds.
+            }
+          }
+          if (applyFingerprint && !useCredentialStore && process.platform !== 'darwin') {
+            trace.phaseSync('syncTelemetryServiceMachineIdMs', () => {
+              syncTelemetryServiceMachineIdBestEffort(
+                targetProfile,
+                appTarget,
+                context.pathOptions,
+              );
+            });
+          }
+        };
+
+        stage = 'preflight';
+        let hotConfirmed = false;
+        let macOSCredentialsApplied = false;
+        if (hotSession) {
+          switchMode = 'hot';
+          await writeSwitchState();
+          macOSCredentialsApplied = process.platform === 'darwin';
+          if (process.platform === 'darwin') {
+            let stopped = false;
+            try {
+              stage = 'hot_stop';
+              options.onDiagnosticStage?.('process-close');
+              stopped = await trace.phase('hotServiceStopMs', hotSession.stopServices);
+            } catch {
+              logger.warn('IDE service stop failed; using a full restart');
+            }
+            if (stopped) {
+              try {
+                await writeSwitchState(false);
+              } catch {
+                logger.warn('IDE credential reassertion failed after the initial write');
+              }
+              stage = 'hot_confirm';
+              try {
+                hotConfirmed = await trace.phase(
+                  'hotServiceConfirmMs',
+                  hotSession.confirmReplacement,
+                );
+              } catch {
+                logger.warn('IDE services did not respawn; using a full restart');
+              }
+            }
+          } else {
+            try {
+              stage = 'hot_stop';
+              options.onDiagnosticStage?.('process-close');
+              const stopped = await trace.phase('hotServiceStopMs', hotSession.stopServices);
+              // The retiring service may flush cached credentials on exit. Reassert the selected
+              // account before confirming its replacement; a failed rewrite is a partial switch.
+              await writeSwitchState(false);
+              if (stopped) {
+                stage = 'hot_confirm';
+                hotConfirmed = await trace.phase(
+                  'hotServiceConfirmMs',
+                  hotSession.confirmReplacement,
+                );
+              }
+              if (!hotConfirmed) {
+                await hotSession.assertCanRestart();
+              }
+            } catch (error) {
+              logger.warn('IDE hot switch could not be confirmed', {
+                stage,
+                reason:
+                  error instanceof AppError
+                    ? error.messageKey
+                    : error instanceof Error
+                      ? error.name
+                      : 'unknown',
+              });
+              if (
+                error instanceof AppError &&
+                error.messageKey === 'process-runtime.switched-hot-unconfirmed'
+              ) {
+                throw error;
+              }
+              throw processError('switched-hot-unconfirmed');
+            }
+          }
+          if (!hotConfirmed) {
+            switchMode = 'hot-fallback';
+            logger.info(
+              'IDE services did not recover within the deadline; restarting the captured IDE',
+            );
+          }
+        }
+
+        if (!hotConfirmed) {
+          stage = 'close';
+          options.onDiagnosticStage?.('process-close');
+          await trace.phase('closeMs', async () => {
+            try {
+              await stopFromContext(context, processExitTimeoutMs);
+            } catch (error) {
+              exitUnconfirmed =
+                error instanceof AppError &&
+                error.messageKey === 'process-runtime.exit-unconfirmed';
+              if (hotSession) {
+                throw processError('switched-hot-unconfirmed');
+              }
+              throw error;
+            }
+          });
+
+          if (!macOSCredentialsApplied) {
+            await writeSwitchState();
+          }
+
+          stage = 'switch';
+          await terms?.apply();
+          stage = 'start';
+          startAttempted = true;
+          options.onDiagnosticStage?.('process-start');
+          await trace.phase('startMs', async () => {
+            try {
+              await startFromContext(context);
+            } catch {
+              throw processError('switched-startup-unconfirmed');
+            }
+          });
+        }
+        if (afterSwitchSuccess) {
+          stage = 'after_success';
+          await trace.phase('afterSwitchSuccessMs', afterSwitchSuccess);
+        }
+        recordSwitchSuccess(scope);
+      } catch (error) {
+        if (!startAttempted && terms) {
+          try {
+            await terms.rollback();
+          } catch (rollbackError) {
+            onFailure?.('perform_switch_failed');
+            recordSwitchFailure(scope, 'perform_switch_failed', 'Classic terms recovery failed');
+            throw new AggregateError([error, rollbackError], 'Classic terms recovery failed');
+          }
+        }
+        const reason = toSwitchFailureReason(stage, error);
+        const message = getErrorMessage(error);
+        failureReason = reason;
+        recordSwitchFailure(scope, reason, message);
+        onFailure?.(reason);
+        throw error;
+      }
+    },
+    () => ({
+      stage,
+      switchMode,
+      exitUnconfirmed,
+      failureReason,
+    }),
+  );
+}
