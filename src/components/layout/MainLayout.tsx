@@ -19,8 +19,8 @@ import {
   Building2,
   Inbox,
   Terminal,
-  Globe,
-  ArrowUpRight,
+  Cpu,
+  BookOpen,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -64,6 +64,16 @@ export const MainLayout: React.FC = () => {
       to: '/playground',
       icon: Terminal,
       label: t('nav.playground', 'Playground'),
+    },
+    {
+      to: '/models',
+      icon: Cpu,
+      label: t('nav.models', 'Models Catalog'),
+    },
+    {
+      to: '/docs',
+      icon: BookOpen,
+      label: t('nav.docs', 'Documentation'),
     },
     {
       to: '/partners',
@@ -120,15 +130,6 @@ export const MainLayout: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-3">
-            <Link
-              to={'/landing' as any}
-              className="h-8 text-xs font-medium px-3 rounded-xl border border-border bg-card hover:bg-accent text-muted-foreground hover:text-foreground flex items-center gap-1.5 transition-all shadow-soft-sm"
-            >
-              <Globe className="h-3.5 w-3.5 text-stone-400" />
-              <span>Public Site</span>
-              <ArrowUpRight className="h-3 w-3 text-stone-400" />
-            </Link>
-
             <div className="font-mono text-xs px-3 py-1.5 rounded-full bg-card border border-border text-muted-foreground flex items-center gap-2 shadow-soft-sm">
               <span className="h-2 w-2 rounded-full bg-[#4D7C5F] animate-pulse"></span>
               <span>

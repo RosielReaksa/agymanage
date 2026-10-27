@@ -4,8 +4,6 @@ import { Search, Sparkles, Zap, Eye, Wrench, CheckCircle2, ArrowRight } from 'lu
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { PublicNavbar } from './PublicNavbar';
-import { PublicFooter } from './PublicFooter';
 import { useSaasModels } from '../../hooks/useSaas';
 import type { ModelInfo } from '../../types';
 
@@ -166,11 +164,8 @@ export const PublicModelsPage: React.FC = () => {
   }, [modelsList, searchTerm, selectedProvider, filterVision, filterTools, filterLargeContext]);
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#FAF8F5] text-stone-900 dark:bg-[#161514] dark:text-[#EFECE6] font-sans selection:bg-[#F4ECE7] selection:text-[#C85A32] dark:selection:bg-[#2A201C] dark:selection:text-[#E28567]">
-      <PublicNavbar />
-
-      <main className="flex-1 py-12 md:py-20">
-        <div className="mx-auto max-w-6xl px-6 space-y-8">
+    <div className="container mx-auto px-6 py-8 max-w-6xl">
+      <div className="space-y-8">
           {/* Header */}
           <div className="space-y-3">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-[#E8D6CC] bg-[#FDF8F6] text-xs font-mono text-[#C85A32] dark:border-[#3D2C24] dark:bg-[#2A201C] dark:text-[#E28567]">
@@ -339,17 +334,14 @@ export const PublicModelsPage: React.FC = () => {
                 Enterprise teams can connect dedicated Google Cloud or Anthropic tenant leases directly into the gateway.
               </p>
             </div>
-            <Link to="/request-access">
+            <Link to="/pool">
               <Button size="sm" className="h-9 px-4 rounded-xl bg-[#C85A32] hover:bg-[#A44422] text-white dark:bg-[#E28567] dark:hover:bg-[#C85A32] dark:text-[#161514] text-xs font-medium whitespace-nowrap">
-                Contact for Enterprise
+                Manage Provider Leases
                 <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
               </Button>
             </Link>
           </div>
         </div>
-      </main>
-
-      <PublicFooter />
     </div>
   );
 };

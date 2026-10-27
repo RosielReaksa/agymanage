@@ -13,8 +13,6 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { PublicNavbar } from './PublicNavbar';
-import { PublicFooter } from './PublicFooter';
 
 const ERROR_CODES = [
   {
@@ -160,12 +158,9 @@ for await (const chunk of stream) {
   ];
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#FAF8F5] text-stone-900 dark:bg-[#161514] dark:text-[#EFECE6] font-sans selection:bg-[#F4ECE7] selection:text-[#C85A32] dark:selection:bg-[#2A201C] dark:selection:text-[#E28567]">
-      <PublicNavbar />
-
-      <main className="flex-1 py-12 md:py-20">
-        <div className="mx-auto max-w-6xl px-6">
-          <div className="grid gap-12 lg:grid-cols-12">
+    <div className="container mx-auto px-6 py-8 max-w-6xl">
+      <div>
+        <div className="grid gap-12 lg:grid-cols-12">
             {/* Sidebar Sticky Navigation */}
             <aside className="lg:col-span-3">
               <div className="sticky top-24 space-y-4">
@@ -186,8 +181,8 @@ for await (const chunk of stream) {
 
                 <div className="pt-4 border-t border-[#E8E4DC] dark:border-[#34312C] px-3 space-y-2">
                   <span className="text-[11px] font-mono text-stone-500">Need an API key?</span>
-                  <Link to="/request-access" className="block text-xs font-medium text-[#C85A32] hover:underline dark:text-[#E28567]">
-                    Request Access &rarr;
+                  <Link to="/" className="block text-xs font-medium text-[#C85A32] hover:underline dark:text-[#E28567]">
+                    Generate Key in Overview &rarr;
                   </Link>
                 </div>
               </div>
@@ -406,9 +401,6 @@ for await (const chunk of stream) {
             </div>
           </div>
         </div>
-      </main>
-
-      <PublicFooter />
-    </div>
+      </div>
   );
 };

@@ -12,16 +12,12 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AccessRequestsRouteImport } from './routes/access-requests'
 import { Route as DocsRouteImport } from './routes/docs'
-import { Route as LandingRouteImport } from './routes/landing'
 import { Route as ModelsRouteImport } from './routes/models'
 import { Route as PartnersRouteImport } from './routes/partners'
 import { Route as PlaygroundRouteImport } from './routes/playground'
 import { Route as PoolRouteImport } from './routes/pool'
-import { Route as PrivacyRouteImport } from './routes/privacy'
 import { Route as ProxyRouteImport } from './routes/proxy'
-import { Route as RequestAccessRouteImport } from './routes/request-access'
 import { Route as SettingsRouteImport } from './routes/settings'
-import { Route as TermsRouteImport } from './routes/terms'
 import { Route as TrafficRouteImport } from './routes/traffic'
 
 const IndexRoute = IndexRouteImport.update({
@@ -37,11 +33,6 @@ const AccessRequestsRoute = AccessRequestsRouteImport.update({
 const DocsRoute = DocsRouteImport.update({
   id: '/docs',
   path: '/docs',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const LandingRoute = LandingRouteImport.update({
-  id: '/landing',
-  path: '/landing',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ModelsRoute = ModelsRouteImport.update({
@@ -64,29 +55,14 @@ const PoolRoute = PoolRouteImport.update({
   path: '/pool',
   getParentRoute: () => rootRouteImport,
 } as any)
-const PrivacyRoute = PrivacyRouteImport.update({
-  id: '/privacy',
-  path: '/privacy',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const ProxyRoute = ProxyRouteImport.update({
   id: '/proxy',
   path: '/proxy',
   getParentRoute: () => rootRouteImport,
 } as any)
-const RequestAccessRoute = RequestAccessRouteImport.update({
-  id: '/request-access',
-  path: '/request-access',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const TermsRoute = TermsRouteImport.update({
-  id: '/terms',
-  path: '/terms',
   getParentRoute: () => rootRouteImport,
 } as any)
 const TrafficRoute = TrafficRouteImport.update({
@@ -99,32 +75,24 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/access-requests': typeof AccessRequestsRoute
   '/docs': typeof DocsRoute
-  '/landing': typeof LandingRoute
   '/models': typeof ModelsRoute
   '/partners': typeof PartnersRoute
   '/playground': typeof PlaygroundRoute
   '/pool': typeof PoolRoute
-  '/privacy': typeof PrivacyRoute
   '/proxy': typeof ProxyRoute
-  '/request-access': typeof RequestAccessRoute
   '/settings': typeof SettingsRoute
-  '/terms': typeof TermsRoute
   '/traffic': typeof TrafficRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/access-requests': typeof AccessRequestsRoute
   '/docs': typeof DocsRoute
-  '/landing': typeof LandingRoute
   '/models': typeof ModelsRoute
   '/partners': typeof PartnersRoute
   '/playground': typeof PlaygroundRoute
   '/pool': typeof PoolRoute
-  '/privacy': typeof PrivacyRoute
   '/proxy': typeof ProxyRoute
-  '/request-access': typeof RequestAccessRoute
   '/settings': typeof SettingsRoute
-  '/terms': typeof TermsRoute
   '/traffic': typeof TrafficRoute
 }
 export interface FileRoutesById {
@@ -132,16 +100,12 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/access-requests': typeof AccessRequestsRoute
   '/docs': typeof DocsRoute
-  '/landing': typeof LandingRoute
   '/models': typeof ModelsRoute
   '/partners': typeof PartnersRoute
   '/playground': typeof PlaygroundRoute
   '/pool': typeof PoolRoute
-  '/privacy': typeof PrivacyRoute
   '/proxy': typeof ProxyRoute
-  '/request-access': typeof RequestAccessRoute
   '/settings': typeof SettingsRoute
-  '/terms': typeof TermsRoute
   '/traffic': typeof TrafficRoute
 }
 export interface FileRouteTypes {
@@ -150,48 +114,36 @@ export interface FileRouteTypes {
     | '/'
     | '/access-requests'
     | '/docs'
-    | '/landing'
     | '/models'
     | '/partners'
     | '/playground'
     | '/pool'
-    | '/privacy'
     | '/proxy'
-    | '/request-access'
     | '/settings'
-    | '/terms'
     | '/traffic'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/access-requests'
     | '/docs'
-    | '/landing'
     | '/models'
     | '/partners'
     | '/playground'
     | '/pool'
-    | '/privacy'
     | '/proxy'
-    | '/request-access'
     | '/settings'
-    | '/terms'
     | '/traffic'
   id:
     | '__root__'
     | '/'
     | '/access-requests'
     | '/docs'
-    | '/landing'
     | '/models'
     | '/partners'
     | '/playground'
     | '/pool'
-    | '/privacy'
     | '/proxy'
-    | '/request-access'
     | '/settings'
-    | '/terms'
     | '/traffic'
   fileRoutesById: FileRoutesById
 }
@@ -199,16 +151,12 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AccessRequestsRoute: typeof AccessRequestsRoute
   DocsRoute: typeof DocsRoute
-  LandingRoute: typeof LandingRoute
   ModelsRoute: typeof ModelsRoute
   PartnersRoute: typeof PartnersRoute
   PlaygroundRoute: typeof PlaygroundRoute
   PoolRoute: typeof PoolRoute
-  PrivacyRoute: typeof PrivacyRoute
   ProxyRoute: typeof ProxyRoute
-  RequestAccessRoute: typeof RequestAccessRoute
   SettingsRoute: typeof SettingsRoute
-  TermsRoute: typeof TermsRoute
   TrafficRoute: typeof TrafficRoute
 }
 
@@ -233,13 +181,6 @@ declare module '@tanstack/react-router' {
       path: '/docs'
       fullPath: '/docs'
       preLoaderRoute: typeof DocsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/landing': {
-      id: '/landing'
-      path: '/landing'
-      fullPath: '/landing'
-      preLoaderRoute: typeof LandingRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/models': {
@@ -270,13 +211,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PoolRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/privacy': {
-      id: '/privacy'
-      path: '/privacy'
-      fullPath: '/privacy'
-      preLoaderRoute: typeof PrivacyRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/proxy': {
       id: '/proxy'
       path: '/proxy'
@@ -284,25 +218,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProxyRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/request-access': {
-      id: '/request-access'
-      path: '/request-access'
-      fullPath: '/request-access'
-      preLoaderRoute: typeof RequestAccessRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/settings': {
       id: '/settings'
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/terms': {
-      id: '/terms'
-      path: '/terms'
-      fullPath: '/terms'
-      preLoaderRoute: typeof TermsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/traffic': {
@@ -319,16 +239,12 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AccessRequestsRoute: AccessRequestsRoute,
   DocsRoute: DocsRoute,
-  LandingRoute: LandingRoute,
   ModelsRoute: ModelsRoute,
   PartnersRoute: PartnersRoute,
   PlaygroundRoute: PlaygroundRoute,
   PoolRoute: PoolRoute,
-  PrivacyRoute: PrivacyRoute,
   ProxyRoute: ProxyRoute,
-  RequestAccessRoute: RequestAccessRoute,
   SettingsRoute: SettingsRoute,
-  TermsRoute: TermsRoute,
   TrafficRoute: TrafficRoute,
 }
 export const routeTree = rootRouteImport
